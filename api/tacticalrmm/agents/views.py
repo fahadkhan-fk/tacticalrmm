@@ -1685,8 +1685,8 @@ def init_file_upload(request, agent_id):
         "session_id": str(session.session_id),
         "destination_path": session.destination_path,
         "filename": session.filename,
-        "total_size": session.total_size,
-        "chunk_size": session.chunk_size,
+        "total_size": str(session.total_size),
+        "chunk_size": str(session.chunk_size),
     }
     response = send_nats_command(
         agent, "files_upload_prepare", prepare_payload, timeout=30

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import re
+import uuid
 from collections import Counter
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union, cast
@@ -43,6 +44,8 @@ from tacticalrmm.constants import (
     AgentTerminalShellChoices,
     CustomFieldType,
     DebugLogType,
+    FileTransferOperation,
+    FileTransferStatus,
     GoArch,
     PAAction,
     PAStatus,
@@ -1320,3 +1323,44 @@ class AgentHistory(models.Model):
 
     def __str__(self) -> str:
         return f"{self.agent.hostname} - {self.type}"
+
+
+class FileTransferSession(models.Model):
+    session_id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    agent = models.ForeignKey(
+        Agent,
+        related_name="file_transfer_sessions",
+        on_delete=models.CASCADE,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        related_name="file_transfer_sessions",
+        on_delete=models.CASCADE,
+    )
+    operation = models.CharField(
+        max_length=16,
+        choices=FileTransferOperation.choices,
+    )
+    status = models.CharField(
+        max_length=32,
+        choices=FileTransferStatus.choices,
+        default=FileTransferStatus.INITIALIZING,
+    )
+    destination_path = models.CharField(max_length=4096)
+    filename = models.CharField(max_length=255)
+    total_size = models.BigIntegerField()
+    chunk_size = models.PositiveIntegerField()
+    committed_offset = models.BigIntegerField(default=0)
+    error_message = models.TextField(blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    expires_at = models.DateTimeField()
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["agent", "status"]),
+            models.Index(fields=["expires_at"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.session_id} ({self.operation}/{self.status})"

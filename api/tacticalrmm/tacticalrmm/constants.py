@@ -38,6 +38,13 @@ CACHE_DB_FIELDS_TASK_LOCK = "cache-db-fields-task-lock-key"
 TRMM_WS_MAX_SIZE = getattr(settings, "TRMM_WS_MAX_SIZE", 100 * 2**20)
 TRMM_MAX_REQUEST_SIZE = getattr(settings, "TRMM_MAX_REQUEST_SIZE", 10 * 2**20)
 
+FILE_TRANSFER_CHUNK_SIZE = getattr(
+    settings, "FILE_TRANSFER_CHUNK_SIZE", 4 * 1024 * 1024
+)
+FILE_TRANSFER_SESSION_TTL_HOURS = getattr(
+    settings, "FILE_TRANSFER_SESSION_TTL_HOURS", 6
+)
+
 
 class GoArch(models.TextChoices):
     AMD64 = "amd64", "amd64"
@@ -607,3 +614,19 @@ AGENT_DARWIN_SHELL_TOKENS = {
 class TerminalModeChoices(models.TextChoices):
     NEW = "new", "Use new terminal"
     LEGACY = "legacy", "Use legacy terminal"
+
+
+class FileTransferOperation(models.TextChoices):
+    UPLOAD = "upload", "Upload"
+    DOWNLOAD = "download", "Download"
+
+
+class FileTransferStatus(models.TextChoices):
+    INITIALIZING = "initializing", "Initializing"
+    WAITING_FOR_AGENT = "waiting_for_agent", "Waiting for agent"
+    AGENT_READY = "agent_ready", "Agent ready"
+    TRANSFERRING = "transferring", "Transferring"
+    COMPLETED = "completed", "Completed"
+    FAILED = "failed", "Failed"
+    CANCELLED = "cancelled", "Cancelled"
+    EXPIRED = "expired", "Expired"

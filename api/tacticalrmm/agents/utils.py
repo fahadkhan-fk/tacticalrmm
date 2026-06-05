@@ -3,6 +3,7 @@ import re
 import urllib.parse
 from io import StringIO
 from pathlib import Path
+from typing import Optional
 
 from django.conf import settings
 from django.http import FileResponse
@@ -182,3 +183,59 @@ def is_posix_abs_path(s: str) -> bool:
     if any(x in s for x in ('"', "'", "\n", "\r", "&", "|", ";")):
         return False
     return s.startswith("/")
+
+
+_INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*\x00')
+_WINDOWS_ABS_PATH_RE = re.compile(r"^(?:[a-zA-Z]:\\|\\\\[^\\]+\\[^\\]+)")
+
+
+def validate_file_transfer_filename(filename: str) -> Optional[str]:
+    name = (filename or "").strip()
+    if not name:
+        return "filename is required"
+    if name in (".", ".."):
+        return "filename is invalid"
+    if len(name) > 255:
+        return "filename is too long"
+    if any(ch in _INVALID_FILENAME_CHARS for ch in name):
+        return "filename contains invalid characters"
+    return None
+
+
+def _path_has_traversal(path: str) -> bool:
+    parts = re.split(r"[\\/]+", path.strip())
+    return ".." in parts
+
+
+def validate_file_transfer_destination_path(path: str, plat: str) -> Optional[str]:
+    value = (path or "").strip()
+    if not value:
+        return "destination_path is required"
+    if any(x in value for x in ('"', "'", "\n", "\r", "&", "|", ";", "\x00")):
+        return "destination_path contains invalid characters"
+    if _path_has_traversal(value):
+        return "destination_path must not contain path traversal"
+
+    if plat == "windows":
+        if not _WINDOWS_ABS_PATH_RE.match(value):
+            return "destination_path must be an absolute Windows path"
+        return None
+
+    if not is_posix_abs_path(value):
+        return "destination_path must be an absolute path"
+    return None
+
+
+def resolve_upload_destination_path(
+    destination_path: str, filename: str, plat: str
+) -> str:
+    destination_path = destination_path.strip()
+    filename = filename.strip()
+    sep = "\\" if plat == "windows" else "/"
+
+    basename = re.split(r"[\\/]+", destination_path.rstrip("\\/"))[-1]
+    if basename.lower() == filename.lower():
+        return destination_path
+
+    base = destination_path.rstrip("\\/")
+    return f"{base}{sep}{filename}"

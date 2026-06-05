@@ -83,4 +83,9 @@ urlpatterns = [
         name="modify_registry_value",
     ),
     path("<agent:agent_id>/terminal-defaults/", views.AgentTerminalDefaults.as_view()),
+    path(
+        "<agent:agent_id>/files/upload/init/",
+        views.init_file_upload,
+        name="init_file_upload",
+    ),
 ]

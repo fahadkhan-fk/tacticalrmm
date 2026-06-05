@@ -41,6 +41,10 @@ from tacticalrmm.constants import (
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
     AGENT_WINDOWS_SHELL_TOKENS,
+    FILE_TRANSFER_CHUNK_SIZE,
+    FILE_TRANSFER_SESSION_TTL_HOURS,
+    FileTransferOperation,
+    FileTransferStatus,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
@@ -62,8 +66,15 @@ from winupdate.models import WinUpdate, WinUpdatePolicy
 from winupdate.serializers import WinUpdatePolicySerializer
 from winupdate.tasks import bulk_check_for_updates_task, bulk_install_updates_task
 
-from .models import Agent, AgentCustomField, AgentHistory, Note
+from .models import (
+    Agent,
+    AgentCustomField,
+    AgentHistory,
+    FileTransferSession,
+    Note,
+)
 from .permissions import (
+    AgentFileBrowserPerms,
     AgentHistoryPerms,
     AgentNotesPerms,
     AgentPerms,
@@ -95,7 +106,13 @@ from .tasks import (
     run_script_email_results_task,
     send_agent_update_task,
 )
-from .utils import get_validated_agent, send_nats_command
+from .utils import (
+    get_validated_agent,
+    resolve_upload_destination_path,
+    send_nats_command,
+    validate_file_transfer_destination_path,
+    validate_file_transfer_filename,
+)
 
 
 class GetAgents(APIView):
@@ -1611,6 +1628,65 @@ def modify_registry_value(request, agent_id):
                 "type": r.get("type", val_type),
                 "data": r.get("data", val_data),
             },
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def init_file_upload(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    filename = (request.data.get("filename") or "").strip()
+    destination_path = (request.data.get("destination_path") or "").strip()
+
+    filename_err = validate_file_transfer_filename(filename)
+    if filename_err:
+        return notify_error(filename_err)
+
+    path_err = validate_file_transfer_destination_path(destination_path, agent.plat)
+    if path_err:
+        return notify_error(path_err)
+
+    try:
+        total_size = int(request.data.get("total_size"))
+    except (TypeError, ValueError):
+        return notify_error("total_size must be a positive integer")
+
+    if total_size < 1:
+        return notify_error("total_size must be a positive integer")
+
+    full_destination_path = resolve_upload_destination_path(
+        destination_path, filename, agent.plat
+    )
+    path_err = validate_file_transfer_destination_path(
+        full_destination_path, agent.plat
+    )
+    if path_err:
+        return notify_error(path_err)
+
+    session = FileTransferSession.objects.create(
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.UPLOAD,
+        status=FileTransferStatus.WAITING_FOR_AGENT,
+        destination_path=full_destination_path,
+        filename=filename,
+        total_size=total_size,
+        chunk_size=FILE_TRANSFER_CHUNK_SIZE,
+        committed_offset=0,
+        expires_at=djangotime.now()
+        + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
+    )
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "chunk_size": session.chunk_size,
+            "committed_offset": session.committed_offset,
         }
     )
 

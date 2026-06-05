@@ -239,3 +239,38 @@ def resolve_upload_destination_path(
 
     base = destination_path.rstrip("\\/")
     return f"{base}{sep}{filename}"
+
+
+_UPLOAD_CONTENT_RANGE_RE = re.compile(
+    r"^bytes (\d+)-(\d+)/(\d+|\*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_upload_content_range(
+    header: str, total_size: int
+) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+    value = (header or "").strip()
+    if not value:
+        return None, "Content-Range header is required"
+
+    match = _UPLOAD_CONTENT_RANGE_RE.match(value)
+    if not match:
+        return None, "Invalid Content-Range header"
+
+    try:
+        start = int(match.group(1))
+        end = int(match.group(2))
+        total_raw = match.group(3)
+        range_total = total_size if total_raw == "*" else int(total_raw)
+    except ValueError:
+        return None, "Invalid Content-Range header"
+
+    if range_total != total_size:
+        return None, "Content-Range total does not match session total_size"
+    if start < 0 or end < start:
+        return None, "Invalid Content-Range byte range"
+    if end >= total_size:
+        return None, "Content-Range exceeds file size"
+
+    return (start, end), None

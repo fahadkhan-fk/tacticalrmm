@@ -88,4 +88,9 @@ urlpatterns = [
         views.init_file_upload,
         name="init_file_upload",
     ),
+    path(
+        "<agent:agent_id>/files/upload/<uuid:session_id>/chunk/",
+        views.upload_file_chunk,
+        name="upload_file_chunk",
+    ),
 ]

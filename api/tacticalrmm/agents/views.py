@@ -45,6 +45,7 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FileTransferOperation,
     FileTransferStatus,
+    TRMM_MAX_REQUEST_SIZE,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
@@ -106,8 +107,10 @@ from .tasks import (
     run_script_email_results_task,
     send_agent_update_task,
 )
+from .file_transfer_relay import store_pending_upload_chunk
 from .utils import (
     get_validated_agent,
+    parse_upload_content_range,
     resolve_upload_destination_path,
     send_nats_command,
     validate_file_transfer_destination_path,
@@ -1735,6 +1738,85 @@ def init_file_upload(request, agent_id):
             "status": session.status,
             "chunk_size": session.chunk_size,
             "committed_offset": session.committed_offset,
+        }
+    )
+
+
+@api_view(["PUT"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def upload_file_chunk(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.UPLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Upload session has expired")
+
+    if session.status not in (
+        FileTransferStatus.AGENT_READY,
+        FileTransferStatus.TRANSFERRING,
+    ):
+        return notify_error("Upload session is not ready to receive chunks")
+
+    content_range = request.META.get("HTTP_CONTENT_RANGE", "")
+    byte_range, range_err = parse_upload_content_range(
+        content_range, session.total_size
+    )
+    if range_err:
+        return notify_error(range_err)
+
+    start, end = byte_range
+    if start != session.committed_offset:
+        return notify_error("Chunk start offset does not match committed_offset")
+
+    expected_len = end - start + 1
+    if expected_len < 1 or expected_len > session.chunk_size:
+        return notify_error("Chunk size exceeds allowed limit")
+
+    content_length = request.META.get("CONTENT_LENGTH")
+    if content_length:
+        try:
+            if int(content_length) != expected_len:
+                return notify_error("Request body size does not match Content-Range")
+        except ValueError:
+            return notify_error("Invalid Content-Length header")
+
+    if expected_len > TRMM_MAX_REQUEST_SIZE:
+        return notify_error("Chunk exceeds maximum request size")
+
+    chunk_data = request.body
+    if len(chunk_data) != expected_len:
+        return notify_error("Request body size does not match Content-Range")
+
+    store_err = store_pending_upload_chunk(session.session_id, start, end, chunk_data)
+    if store_err:
+        return notify_error(store_err)
+
+    update_fields = ["updated_at"]
+    if session.status == FileTransferStatus.AGENT_READY:
+        session.status = FileTransferStatus.TRANSFERRING
+        update_fields.append("status")
+    session.save(update_fields=update_fields)
+
+    # committed_offset is unchanged here; agent pull + write ack updates it later.
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "committed_offset": session.committed_offset,
+            "chunk_start": start,
+            "chunk_end": end,
+            "chunk_bytes": len(chunk_data),
         }
     )
 

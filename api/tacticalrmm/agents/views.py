@@ -1681,6 +1681,54 @@ def init_file_upload(request, agent_id):
         + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
     )
 
+    prepare_payload = {
+        "session_id": str(session.session_id),
+        "destination_path": session.destination_path,
+        "filename": session.filename,
+        "total_size": session.total_size,
+        "chunk_size": session.chunk_size,
+    }
+    response = send_nats_command(
+        agent, "files_upload_prepare", prepare_payload, timeout=30
+    )
+
+    if isinstance(response, Response):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(response.data)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return response
+
+    if not isinstance(response, dict):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid agent response"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid agent response")
+
+    if response.get("status") != "ready":
+        error_message = response.get("error") or "Agent failed to prepare upload"
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(error_message)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error(str(error_message))
+
+    try:
+        committed_offset = int(response.get("committed_offset", 0))
+    except (TypeError, ValueError):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid committed_offset from agent"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid committed_offset from agent")
+
+    if committed_offset < 0 or committed_offset > session.total_size:
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid committed_offset from agent"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid committed_offset from agent")
+
+    session.status = FileTransferStatus.AGENT_READY
+    session.committed_offset = committed_offset
+    session.save(update_fields=["status", "committed_offset", "updated_at"])
+
     return Response(
         {
             "session_id": str(session.session_id),

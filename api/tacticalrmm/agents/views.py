@@ -107,7 +107,7 @@ from .tasks import (
     run_script_email_results_task,
     send_agent_update_task,
 )
-from .file_transfer_relay import store_pending_upload_chunk
+from .file_transfer_relay import clear_pending_upload_chunk, store_pending_upload_chunk
 from .utils import (
     get_validated_agent,
     parse_upload_content_range,
@@ -1817,6 +1817,77 @@ def upload_file_chunk(request, agent_id, session_id):
             "chunk_start": start,
             "chunk_end": end,
             "chunk_bytes": len(chunk_data),
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def complete_file_upload(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.UPLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Upload session has expired")
+
+    if session.status not in (
+        FileTransferStatus.AGENT_READY,
+        FileTransferStatus.TRANSFERRING,
+    ):
+        return notify_error("Upload session is not ready to complete")
+
+    if session.committed_offset != session.total_size:
+        return notify_error("Upload is not complete")
+
+    finalize_payload = {
+        "session_id": str(session.session_id),
+        "destination_path": session.destination_path,
+        "total_size": str(session.total_size),
+    }
+    response = send_nats_command(
+        agent, "files_upload_finalize", finalize_payload, timeout=30
+    )
+
+    if isinstance(response, Response):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(response.data)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return response
+
+    if not isinstance(response, dict):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid agent response"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid agent response")
+
+    if response.get("status") != "completed":
+        error_message = response.get("error") or "Agent failed to finalize upload"
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(error_message)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error(str(error_message))
+
+    clear_pending_upload_chunk(session.session_id)
+    session.status = FileTransferStatus.COMPLETED
+    session.save(update_fields=["status", "updated_at"])
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "destination_path": session.destination_path,
+            "committed_offset": session.committed_offset,
         }
     )
 

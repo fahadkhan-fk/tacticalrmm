@@ -37,6 +37,9 @@ CACHE_DB_FIELDS_TASK_LOCK = "cache-db-fields-task-lock-key"
 
 TRMM_WS_MAX_SIZE = getattr(settings, "TRMM_WS_MAX_SIZE", 100 * 2**20)
 TRMM_MAX_REQUEST_SIZE = getattr(settings, "TRMM_MAX_REQUEST_SIZE", 10 * 2**20)
+DATA_UPLOAD_MAX_MEMORY_SIZE = getattr(
+    settings, "DATA_UPLOAD_MAX_MEMORY_SIZE", 10 * 2**20
+)
 
 FILE_TRANSFER_CHUNK_SIZE = getattr(
     settings, "FILE_TRANSFER_CHUNK_SIZE", 4 * 1024 * 1024

@@ -131,6 +131,17 @@ with suppress(ImportError):
 with suppress(ImportError):
     from .local_settings import *  # noqa
 
+try:
+    TRMM_MAX_REQUEST_SIZE
+except NameError:
+    TRMM_MAX_REQUEST_SIZE = 10 * 2**20
+
+try:
+    DATA_UPLOAD_MAX_MEMORY_SIZE
+except NameError:
+    # Django enforces this before views run; must be >= FILE_TRANSFER_CHUNK_SIZE (4 MiB).
+    DATA_UPLOAD_MAX_MEMORY_SIZE = TRMM_MAX_REQUEST_SIZE
+
 if "GHACTIONS" in os.environ:
     print("-----------------------GHACTIONS----------------------------")
     DATABASES = {
@@ -289,6 +300,17 @@ MIDDLEWARE = [
 if SWAGGER_ENABLED:
     INSTALLED_APPS += ("drf_spectacular",)
 
+
+def _silky_intercept(request) -> bool:
+    # Large binary relay endpoints break django-silk finalise on dev servers.
+    path = request.path
+    if "/files/upload/" in path and path.endswith("/chunk/"):
+        return False
+    if "/api/internal/file-transfers/" in path:
+        return False
+    return True
+
+
 if DEBUG and not DEMO:
     INSTALLED_APPS.insert(0, "daphne")
     INSTALLED_APPS += (
@@ -297,6 +319,7 @@ if DEBUG and not DEMO:
     )
 
     MIDDLEWARE.insert(0, "silk.middleware.SilkyMiddleware")
+    SILKY_INTERCEPT_FUNC = _silky_intercept
 
 if ADMIN_ENABLED:
     MIDDLEWARE += ("django.contrib.messages.middleware.MessageMiddleware",)

@@ -93,4 +93,9 @@ urlpatterns = [
         views.upload_file_chunk,
         name="upload_file_chunk",
     ),
+    path(
+        "<agent:agent_id>/files/upload/<uuid:session_id>/complete/",
+        views.complete_file_upload,
+        name="complete_file_upload",
+    ),
 ]

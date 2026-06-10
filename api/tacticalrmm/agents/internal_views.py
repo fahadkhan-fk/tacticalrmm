@@ -7,10 +7,19 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from tacticalrmm.constants import FileTransferOperation, FileTransferStatus
+from tacticalrmm.constants import (
+    FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
+    FileTransferOperation,
+    FileTransferStatus,
+)
 from tacticalrmm.helpers import notify_error
 
-from .file_transfer_relay import pop_pending_upload_chunk
+from .file_transfer_relay import (
+    get_accepted_offset,
+    get_upload_ack,
+    pop_upload_chunk,
+    signal_upload_ack,
+)
 from .models import FileTransferSession
 
 
@@ -44,7 +53,10 @@ class FileTransferNextChunk(APIView):
         ):
             return notify_error("Upload session is not ready for chunk transfer")
 
-        chunk = pop_pending_upload_chunk(session.session_id)
+        redis_committed = get_upload_ack(session.session_id)
+        committed = max(session.committed_offset, redis_committed or 0)
+
+        chunk = pop_upload_chunk(session.session_id, committed)
         if chunk is None:
             return Response("No pending chunk", status=status.HTTP_404_NOT_FOUND)
 
@@ -98,17 +110,45 @@ class FileTransferAck(APIView):
         if committed_offset < 1 or committed_offset > session.total_size:
             return notify_error("committed_offset is out of range")
 
-        if committed_offset < session.committed_offset:
+        redis_committed = get_upload_ack(session.session_id)
+        current_committed = max(session.committed_offset, redis_committed or 0)
+
+        if committed_offset < current_committed:
             return notify_error("committed_offset cannot decrease")
 
-        if committed_offset == session.committed_offset:
-            return Response({"committed_offset": session.committed_offset})
+        accepted_offset = get_accepted_offset(session.session_id)
+        if accepted_offset is not None and committed_offset > accepted_offset:
+            return notify_error("committed_offset exceeds accepted_offset")
 
-        update_fields = ["committed_offset", "updated_at"]
-        session.committed_offset = committed_offset
-        if session.status == FileTransferStatus.AGENT_READY:
-            session.status = FileTransferStatus.TRANSFERRING
-            update_fields.append("status")
-        session.save(update_fields=update_fields)
+        if committed_offset == current_committed:
+            signal_upload_ack(session.session_id, committed_offset)
+            return Response({"committed_offset": committed_offset})
 
-        return Response({"committed_offset": session.committed_offset})
+        should_checkpoint = (
+            committed_offset == session.total_size
+            or committed_offset - session.committed_offset
+            >= FILE_TRANSFER_ACK_CHECKPOINT_BYTES
+        )
+        if should_checkpoint:
+            now = djangotime.now()
+            update_fields = [
+                "committed_offset",
+                "pending_chunk_start",
+                "pending_chunk_end",
+                "pending_chunk_created_at",
+                "last_ack_at",
+                "updated_at",
+            ]
+            session.committed_offset = committed_offset
+            session.pending_chunk_start = None
+            session.pending_chunk_end = None
+            session.pending_chunk_created_at = None
+            session.last_ack_at = now
+            if session.status == FileTransferStatus.AGENT_READY:
+                session.status = FileTransferStatus.TRANSFERRING
+                update_fields.append("status")
+            session.save(update_fields=update_fields)
+
+        signal_upload_ack(session.session_id, committed_offset)
+
+        return Response({"committed_offset": committed_offset})

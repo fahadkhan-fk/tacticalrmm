@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+import logging
 import random
 import string
 import time
@@ -41,7 +42,10 @@ from tacticalrmm.constants import (
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
     AGENT_WINDOWS_SHELL_TOKENS,
+    FILE_TRANSFER_ACK_WAIT_SECONDS,
     FILE_TRANSFER_CHUNK_SIZE,
+    FILE_TRANSFER_CHUNK_SIZE_MAX,
+    FILE_TRANSFER_CHUNK_SIZE_MIN,
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FileTransferOperation,
     FileTransferStatus,
@@ -107,15 +111,25 @@ from .tasks import (
     run_script_email_results_task,
     send_agent_update_task,
 )
-from .file_transfer_relay import clear_pending_upload_chunk, store_pending_upload_chunk
+from .file_transfer_relay import (
+    clear_upload_session_redis,
+    get_accepted_offset,
+    get_upload_ack,
+    rollback_upload_chunk,
+    store_upload_chunk,
+    wait_for_upload_ack,
+)
 from .utils import (
     get_validated_agent,
     parse_upload_content_range,
     resolve_upload_destination_path,
     send_nats_command,
+    send_nats_notification,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
 )
+
+logger = logging.getLogger("trmm_file_transfer")
 
 
 class GetAgents(APIView):
@@ -1670,6 +1684,19 @@ def init_file_upload(request, agent_id):
     if path_err:
         return notify_error(path_err)
 
+    raw_chunk_size = request.data.get("chunk_size")
+    if raw_chunk_size is not None:
+        try:
+            requested_chunk_size = int(raw_chunk_size)
+        except (TypeError, ValueError):
+            return notify_error("chunk_size must be a positive integer")
+        chunk_size = max(
+            FILE_TRANSFER_CHUNK_SIZE_MIN,
+            min(requested_chunk_size, FILE_TRANSFER_CHUNK_SIZE_MAX),
+        )
+    else:
+        chunk_size = FILE_TRANSFER_CHUNK_SIZE
+
     session = FileTransferSession.objects.create(
         agent=agent,
         user=request.user,
@@ -1678,7 +1705,7 @@ def init_file_upload(request, agent_id):
         destination_path=full_destination_path,
         filename=filename,
         total_size=total_size,
-        chunk_size=FILE_TRANSFER_CHUNK_SIZE,
+        chunk_size=chunk_size,
         committed_offset=0,
         expires_at=djangotime.now()
         + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
@@ -1745,6 +1772,20 @@ def init_file_upload(request, agent_id):
 @api_view(["PUT"])
 @permission_classes([IsAuthenticated, AgentFileBrowserPerms])
 def upload_file_chunk(request, agent_id, session_id):
+    """Accept one chunk from the client.
+
+    Depth-1 prefetch protocol:
+      - Django accepts up to 1 chunk ahead of what the agent has committed.
+      - The PUT returns immediately once the chunk is stored in Redis and
+        NATS-notified.  The client does NOT wait for the agent to write.
+      - If the client is already 1 chunk ahead (depth full), the PUT blocks
+        only until the agent commits the previous chunk, then accepts and
+        returns immediately.
+
+    Response fields:
+      accepted_offset  — client should start the next chunk here
+      committed_offset — last offset confirmed written by the agent
+    """
     agent = get_validated_agent(agent_id)
     if isinstance(agent, Response):
         return agent
@@ -1776,10 +1817,8 @@ def upload_file_chunk(request, agent_id, session_id):
         return notify_error(range_err)
 
     start, end = byte_range
-    if start != session.committed_offset:
-        return notify_error("Chunk start offset does not match committed_offset")
-
     expected_len = end - start + 1
+
     if expected_len < 1 or expected_len > session.chunk_size:
         return notify_error("Chunk size exceeds allowed limit")
 
@@ -1798,22 +1837,87 @@ def upload_file_chunk(request, agent_id, session_id):
     if len(chunk_data) != expected_len:
         return notify_error("Request body size does not match Content-Range")
 
-    store_err = store_pending_upload_chunk(session.session_id, start, end, chunk_data)
+    redis_committed = get_upload_ack(session.session_id)
+    committed = max(session.committed_offset, redis_committed or 0)
+
+    redis_accepted = get_accepted_offset(session.session_id)
+    accepted = max(redis_accepted or 0, committed)
+
+    if start != accepted:
+        return notify_error(
+            f"Chunk start offset {start} does not match expected {accepted}"
+        )
+
+    depth_wait_ms = 0.0
+    if start - committed > session.chunk_size:
+        min_committed = start - session.chunk_size
+        depth_wait_t0 = time.monotonic()
+        new_committed = wait_for_upload_ack(
+            session.session_id,
+            min_committed,
+            timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
+        )
+        depth_wait_ms = (time.monotonic() - depth_wait_t0) * 1000
+        if new_committed is None:
+            session.refresh_from_db(fields=["status", "error_message"])
+            if session.status == FileTransferStatus.FAILED:
+                clear_upload_session_redis(session.session_id)
+                return notify_error(session.error_message or "Upload failed")
+            session.status = FileTransferStatus.FAILED
+            session.error_message = (
+                "Timed out waiting for agent to commit previous chunk"
+            )
+            session.save(update_fields=["status", "error_message", "updated_at"])
+            return notify_error(session.error_message)
+        committed = new_committed
+
+    receive_t0 = time.monotonic()
+    store_err = store_upload_chunk(session.session_id, start, end, chunk_data)
+    chunk_receive_ms = (time.monotonic() - receive_t0) * 1000
     if store_err:
         return notify_error(store_err)
 
-    update_fields = ["updated_at"]
     if session.status == FileTransferStatus.AGENT_READY:
         session.status = FileTransferStatus.TRANSFERRING
-        update_fields.append("status")
-    session.save(update_fields=update_fields)
+        session.save(update_fields=["status", "updated_at"])
 
-    # committed_offset is unchanged here; agent pull + write ack updates it later.
+    notify_payload = {
+        "session_id": str(session.session_id),
+        "chunk_start": str(start),
+        "chunk_end": str(end),
+        "chunk_size": str(len(chunk_data)),
+    }
+    notify_t0 = time.monotonic()
+    notify_err = send_nats_notification(
+        agent, "files_upload_chunk_available", notify_payload
+    )
+    chunk_notify_ms = (time.monotonic() - notify_t0) * 1000
+
+    if notify_err is not None:
+        rollback_upload_chunk(session.session_id, start, prev_accepted=start)
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(notify_err.data)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_err
+
+    accepted_offset = end + 1
+    logger.info(
+        "file_transfer upload chunk accepted session=%s start=%s end=%s "
+        "chunk_receive_ms=%.1f chunk_notify_ms=%.1f depth_wait_ms=%.1f",
+        session.session_id,
+        start,
+        end,
+        chunk_receive_ms,
+        chunk_notify_ms,
+        depth_wait_ms,
+    )
+
     return Response(
         {
             "session_id": str(session.session_id),
             "status": session.status,
-            "committed_offset": session.committed_offset,
+            "accepted_offset": accepted_offset,
+            "committed_offset": committed,
             "chunk_start": start,
             "chunk_end": end,
             "chunk_bytes": len(chunk_data),
@@ -1847,8 +1951,38 @@ def complete_file_upload(request, agent_id, session_id):
     ):
         return notify_error("Upload session is not ready to complete")
 
-    if session.committed_offset != session.total_size:
-        return notify_error("Upload is not complete")
+    redis_committed = get_upload_ack(session.session_id)
+    committed_offset = max(session.committed_offset, redis_committed or 0)
+
+    if committed_offset < session.total_size:
+        new_committed = wait_for_upload_ack(
+            session.session_id,
+            session.total_size,
+            timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
+        )
+        if new_committed is None or new_committed < session.total_size:
+            session.status = FileTransferStatus.FAILED
+            session.error_message = "Timed out waiting for agent to commit final chunk"
+            session.save(update_fields=["status", "error_message", "updated_at"])
+            return notify_error(session.error_message)
+        committed_offset = new_committed
+
+    if session.committed_offset != committed_offset:
+        session.committed_offset = committed_offset
+        session.pending_chunk_start = None
+        session.pending_chunk_end = None
+        session.pending_chunk_created_at = None
+        session.last_ack_at = djangotime.now()
+        session.save(
+            update_fields=[
+                "committed_offset",
+                "pending_chunk_start",
+                "pending_chunk_end",
+                "pending_chunk_created_at",
+                "last_ack_at",
+                "updated_at",
+            ]
+        )
 
     finalize_payload = {
         "session_id": str(session.session_id),
@@ -1878,7 +2012,7 @@ def complete_file_upload(request, agent_id, session_id):
         session.save(update_fields=["status", "error_message", "updated_at"])
         return notify_error(str(error_message))
 
-    clear_pending_upload_chunk(session.session_id)
+    clear_upload_session_redis(session.session_id)
     session.status = FileTransferStatus.COMPLETED
     session.save(update_fields=["status", "updated_at"])
 
@@ -1887,7 +2021,7 @@ def complete_file_upload(request, agent_id, session_id):
             "session_id": str(session.session_id),
             "status": session.status,
             "destination_path": session.destination_path,
-            "committed_offset": session.committed_offset,
+            "committed_offset": committed_offset,
         }
     )
 

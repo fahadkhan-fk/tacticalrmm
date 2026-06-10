@@ -1,5 +1,6 @@
 import asyncio
 import re
+import threading
 import urllib.parse
 from io import StringIO
 from pathlib import Path
@@ -9,6 +10,7 @@ from django.conf import settings
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from packaging import version as pyver
+from rest_framework.response import Response
 
 from checks.models import CheckResult
 from core.utils import get_core_settings, get_mesh_device_id, get_mesh_ws_url
@@ -99,6 +101,43 @@ def get_validated_agent(agent_id, min_version="2.10.0"):
         )
 
     return agent
+
+
+_nats_notify_loop: Optional[asyncio.AbstractEventLoop] = None
+_nats_notify_thread: Optional[threading.Thread] = None
+_nats_notify_lock = threading.Lock()
+
+
+def _ensure_nats_notify_loop() -> asyncio.AbstractEventLoop:
+    global _nats_notify_loop, _nats_notify_thread
+    with _nats_notify_lock:
+        if _nats_notify_loop is None:
+            loop = asyncio.new_event_loop()
+
+            def _run() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            _nats_notify_thread = threading.Thread(
+                target=_run, daemon=True, name="nats-notify"
+            )
+            _nats_notify_thread.start()
+            _nats_notify_loop = loop
+    return _nats_notify_loop
+
+
+def send_nats_notification(agent, func: str, payload: dict) -> Optional[Response]:
+    loop = _ensure_nats_notify_loop()
+    data = {"func": func, "payload": payload}
+    try:
+        future = asyncio.run_coroutine_threadsafe(
+            agent.nats_cmd(data, wait=False),
+            loop,
+        )
+        future.result(timeout=10)
+    except Exception as e:
+        return notify_error(f"NATS communication failed: {str(e)}")
+    return None
 
 
 def send_nats_command(agent, func: str, payload: dict, timeout: int = 60):

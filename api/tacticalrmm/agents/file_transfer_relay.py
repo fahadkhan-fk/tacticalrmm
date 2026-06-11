@@ -32,6 +32,20 @@ redis.call('SET', KEYS[3], ARGV[4], 'EX', ARGV[5])
 return 1
 """
 
+_POP_CHUNK_SCRIPT = """
+local meta = redis.call('GET', KEYS[1])
+if not meta then
+    return {false}
+end
+local data = redis.call('GET', KEYS[2])
+if not data then
+    redis.call('DEL', KEYS[1])
+    return {false}
+end
+redis.call('DEL', KEYS[1], KEYS[2])
+return {meta, data}
+"""
+
 
 @lru_cache(maxsize=1)
 def _redis_client() -> Redis:
@@ -43,12 +57,21 @@ def _store_chunk_redis_script():
     return _redis_client().register_script(_STORE_CHUNK_SCRIPT)
 
 
+@lru_cache(maxsize=1)
+def _pop_chunk_redis_script():
+    return _redis_client().register_script(_POP_CHUNK_SCRIPT)
+
+
+def _chunk_prefix(session_id: UUID) -> str:
+    return f"upload:chunk:{session_id}/"
+
+
 def _chunk_data_key_at(session_id: UUID, start: int) -> str:
-    return f"upload:chunk:{session_id}:{start}:data"
+    return f"{_chunk_prefix(session_id)}{start}:data"
 
 
 def _chunk_meta_key_at(session_id: UUID, start: int) -> str:
-    return f"upload:chunk:{session_id}:{start}:meta"
+    return f"{_chunk_prefix(session_id)}{start}:meta"
 
 
 def _ack_key(session_id: UUID) -> str:
@@ -119,21 +142,21 @@ def rollback_upload_chunk(session_id: UUID, start: int, prev_accepted: int) -> N
 
 
 def pop_upload_chunk(session_id: UUID, start: int) -> Optional[PendingUploadChunk]:
-    """Atomically pop (fetch + delete) the chunk stored at `start`."""
-    client = _redis_client()
+    """Atomically fetch and delete the chunk stored at `start`.
+
+    Executes via a Lua script so that GET meta + GET data + DEL both keys runs
+    as a single Redis transaction.  A concurrent caller at the same offset will
+    always see None rather than a partial result.
+    """
     meta_key = _chunk_meta_key_at(session_id, start)
     data_key = _chunk_data_key_at(session_id, start)
 
-    meta_raw = client.get(meta_key)
-    if meta_raw is None:
+    result = _pop_chunk_redis_script()(keys=[meta_key, data_key])
+
+    if not result or result[0] is False or result[0] is None:
         return None
 
-    data = client.get(data_key)
-    if data is None:
-        return None
-
-    client.delete(data_key, meta_key)
-
+    meta_raw, data = result[0], result[1]
     meta = json.loads(meta_raw.decode())
     return PendingUploadChunk(
         start=int(meta["start"]),
@@ -212,7 +235,7 @@ def clear_upload_session_redis(session_id: UUID) -> None:
     client = _redis_client()
     client.delete(_ack_key(session_id), _accepted_key(session_id))
     for pattern in (
-        f"upload:chunk:{session_id}:*",
+        f"{_chunk_prefix(session_id)}*",
         f"upload:ack_event:{session_id}:*",
     ):
         for key in client.scan_iter(match=pattern):

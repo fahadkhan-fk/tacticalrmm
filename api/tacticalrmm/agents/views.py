@@ -42,6 +42,7 @@ from tacticalrmm.constants import (
     AGENT_STATUS_OFFLINE,
     AGENT_STATUS_ONLINE,
     AGENT_WINDOWS_SHELL_TOKENS,
+    FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
     FILE_TRANSFER_ACK_WAIT_SECONDS,
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_CHUNK_SIZE_MAX,
@@ -112,11 +113,18 @@ from .tasks import (
     send_agent_update_task,
 )
 from .file_transfer_relay import (
+    clear_download_session_redis,
     clear_upload_session_redis,
     get_accepted_offset,
+    get_download_ack,
+    get_download_offered_offset,
     get_upload_ack,
+    pop_download_chunk,
     rollback_upload_chunk,
+    signal_download_ack,
     store_upload_chunk,
+    wait_for_download_ack,
+    wait_for_download_chunk,
     wait_for_upload_ack,
 )
 from .utils import (
@@ -2021,6 +2029,342 @@ def complete_file_upload(request, agent_id, session_id):
             "session_id": str(session.session_id),
             "status": session.status,
             "destination_path": session.destination_path,
+            "committed_offset": committed_offset,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def init_file_download(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    source_path = (request.data.get("source_path") or "").strip()
+    path_err = validate_file_transfer_destination_path(source_path, agent.plat)
+    if path_err:
+        return notify_error(path_err)
+
+    raw_chunk_size = request.data.get("chunk_size")
+    if raw_chunk_size is not None:
+        try:
+            requested_chunk_size = int(raw_chunk_size)
+        except (TypeError, ValueError):
+            return notify_error("chunk_size must be a positive integer")
+        chunk_size = max(
+            FILE_TRANSFER_CHUNK_SIZE_MIN,
+            min(requested_chunk_size, FILE_TRANSFER_CHUNK_SIZE_MAX),
+        )
+    else:
+        chunk_size = FILE_TRANSFER_CHUNK_SIZE
+
+    session = FileTransferSession.objects.create(
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+        status=FileTransferStatus.WAITING_FOR_AGENT,
+        destination_path=source_path,
+        filename=source_path.split("/")[-1].split("\\")[-1] or "download",
+        total_size=0,
+        chunk_size=chunk_size,
+        committed_offset=0,
+        expires_at=djangotime.now()
+        + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
+    )
+
+    prepare_payload = {
+        "session_id": str(session.session_id),
+        "source_path": source_path,
+        "chunk_size": str(chunk_size),
+    }
+    response = send_nats_command(
+        agent, "files_download_prepare", prepare_payload, timeout=30
+    )
+
+    if isinstance(response, Response):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(response.data)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return response
+
+    if not isinstance(response, dict):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid agent response"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid agent response")
+
+    if response.get("status") != "ready":
+        error_message = response.get("error") or "Agent failed to prepare download"
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(error_message)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error(str(error_message))
+
+    try:
+        total_size = int(response.get("total_size", 0))
+    except (TypeError, ValueError):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid total_size from agent"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid total_size from agent")
+
+    if total_size < 1:
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Agent reported empty or invalid file"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Agent reported empty or invalid file")
+
+    session.total_size = total_size
+    session.status = FileTransferStatus.AGENT_READY
+    session.save(update_fields=["total_size", "status", "updated_at"])
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "total_size": total_size,
+            "chunk_size": chunk_size,
+            "committed_offset": 0,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def get_file_download_chunk(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Download session has expired")
+
+    if session.status not in (
+        FileTransferStatus.AGENT_READY,
+        FileTransferStatus.TRANSFERRING,
+    ):
+        return notify_error("Download session is not ready to serve chunks")
+
+    try:
+        client_committed = int(request.query_params.get("committed_offset", 0))
+    except (TypeError, ValueError):
+        client_committed = 0
+    redis_committed = get_download_ack(session.session_id)
+    committed = max(session.committed_offset, redis_committed or 0, client_committed)
+
+    wait_t0 = time.monotonic()
+    offered = wait_for_download_chunk(
+        session.session_id,
+        committed,
+        timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
+    )
+    wait_ms = (time.monotonic() - wait_t0) * 1000
+
+    if offered is None:
+        session.refresh_from_db(fields=["status", "error_message"])
+        if session.status == FileTransferStatus.FAILED:
+            return notify_error(session.error_message or "Download failed")
+        return notify_error("Timed out waiting for agent to push chunk")
+
+    chunk = pop_download_chunk(session.session_id, committed)
+    if chunk is None:
+        return notify_error("Chunk vanished from relay buffer")
+
+    logger.info(
+        "file_transfer download chunk served session=%s start=%s end=%s wait_ms=%.1f",
+        session.session_id,
+        chunk.start,
+        chunk.end,
+        wait_ms,
+    )
+
+    response = HttpResponse(chunk.data, content_type="application/octet-stream")
+    response["Content-Range"] = f"bytes {chunk.start}-{chunk.end}/{session.total_size}"
+    response["X-Chunk-Start"] = str(chunk.start)
+    response["X-Chunk-End"] = str(chunk.end)
+    return response
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def ack_file_download_chunk(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Download session has expired")
+
+    if session.status not in (
+        FileTransferStatus.AGENT_READY,
+        FileTransferStatus.TRANSFERRING,
+    ):
+        return notify_error("Download session is not ready for ACK")
+
+    try:
+        committed_offset = int(request.data.get("committed_offset"))
+    except (TypeError, ValueError):
+        return notify_error("committed_offset must be a positive integer")
+
+    if committed_offset < 1 or committed_offset > session.total_size:
+        return notify_error("committed_offset is out of range")
+
+    redis_committed = get_download_ack(session.session_id)
+    current_committed = max(session.committed_offset, redis_committed or 0)
+
+    if committed_offset < current_committed:
+        return notify_error("committed_offset cannot decrease")
+
+    redis_offered = get_download_offered_offset(session.session_id)
+    if redis_offered is not None and committed_offset > redis_offered:
+        return notify_error("committed_offset exceeds offered_offset")
+
+    should_checkpoint = (
+        committed_offset == session.total_size
+        or committed_offset - session.committed_offset
+        >= FILE_TRANSFER_ACK_CHECKPOINT_BYTES
+    )
+    if should_checkpoint:
+        now = djangotime.now()
+        update_fields = [
+            "committed_offset",
+            "pending_chunk_start",
+            "pending_chunk_end",
+            "pending_chunk_created_at",
+            "last_ack_at",
+            "updated_at",
+        ]
+        session.committed_offset = committed_offset
+        session.pending_chunk_start = None
+        session.pending_chunk_end = None
+        session.pending_chunk_created_at = None
+        session.last_ack_at = now
+        if session.status == FileTransferStatus.AGENT_READY:
+            session.status = FileTransferStatus.TRANSFERRING
+            update_fields.append("status")
+        session.save(update_fields=update_fields)
+
+    signal_download_ack(session.session_id, committed_offset)
+
+    return Response({"committed_offset": committed_offset})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def complete_file_download(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Download session has expired")
+
+    if session.status not in (
+        FileTransferStatus.AGENT_READY,
+        FileTransferStatus.TRANSFERRING,
+    ):
+        return notify_error("Download session is not ready to complete")
+
+    redis_committed = get_download_ack(session.session_id)
+    committed_offset = max(session.committed_offset, redis_committed or 0)
+
+    if committed_offset < session.total_size:
+        new_committed = wait_for_download_ack(
+            session.session_id,
+            session.total_size,
+            timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
+        )
+        if new_committed is None or new_committed < session.total_size:
+            session.status = FileTransferStatus.FAILED
+            session.error_message = "Timed out waiting for client to ACK all chunks"
+            session.save(update_fields=["status", "error_message", "updated_at"])
+            return notify_error(session.error_message)
+        committed_offset = new_committed
+
+    if session.committed_offset != committed_offset:
+        session.committed_offset = committed_offset
+        session.pending_chunk_start = None
+        session.pending_chunk_end = None
+        session.pending_chunk_created_at = None
+        session.last_ack_at = djangotime.now()
+        session.save(
+            update_fields=[
+                "committed_offset",
+                "pending_chunk_start",
+                "pending_chunk_end",
+                "pending_chunk_created_at",
+                "last_ack_at",
+                "updated_at",
+            ]
+        )
+
+    finalize_payload = {
+        "session_id": str(session.session_id),
+        "source_path": session.destination_path,
+    }
+    response = send_nats_command(
+        agent, "files_download_finalize", finalize_payload, timeout=30
+    )
+
+    if isinstance(response, Response):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(response.data)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return response
+
+    if not isinstance(response, dict):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid agent response"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid agent response")
+
+    if response.get("status") != "completed":
+        error_message = response.get("error") or "Agent failed to finalize download"
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(error_message)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error(str(error_message))
+
+    clear_download_session_redis(session.session_id)
+    session.status = FileTransferStatus.COMPLETED
+    session.save(update_fields=["status", "updated_at"])
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "source_path": session.destination_path,
             "committed_offset": committed_offset,
         }
     )

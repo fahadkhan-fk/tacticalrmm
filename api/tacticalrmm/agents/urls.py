@@ -98,4 +98,24 @@ urlpatterns = [
         views.complete_file_upload,
         name="complete_file_upload",
     ),
+    path(
+        "<agent:agent_id>/files/download/init/",
+        views.init_file_download,
+        name="init_file_download",
+    ),
+    path(
+        "<agent:agent_id>/files/download/<uuid:session_id>/chunk/",
+        views.get_file_download_chunk,
+        name="get_file_download_chunk",
+    ),
+    path(
+        "<agent:agent_id>/files/download/<uuid:session_id>/ack/",
+        views.ack_file_download_chunk,
+        name="ack_file_download_chunk",
+    ),
+    path(
+        "<agent:agent_id>/files/download/<uuid:session_id>/complete/",
+        views.complete_file_download,
+        name="complete_file_download",
+    ),
 ]

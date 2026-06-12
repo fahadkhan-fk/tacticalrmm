@@ -1,6 +1,10 @@
 from django.urls import path
 
-from .internal_views import FileTransferAck, FileTransferNextChunk
+from .internal_views import (
+    FileTransferAck,
+    FileTransferDownloadPutChunk,
+    FileTransferNextChunk,
+)
 
 urlpatterns = [
     path(
@@ -12,5 +16,10 @@ urlpatterns = [
         "file-transfers/<uuid:session_id>/ack/",
         FileTransferAck.as_view(),
         name="file_transfer_ack",
+    ),
+    path(
+        "file-transfers/<uuid:session_id>/download-chunk/",
+        FileTransferDownloadPutChunk.as_view(),
+        name="file_transfer_download_put_chunk",
     ),
 ]

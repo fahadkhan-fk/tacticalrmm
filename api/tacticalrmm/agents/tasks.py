@@ -15,8 +15,11 @@ from tacticalrmm.constants import (
     AGENT_DEFER,
     AGENT_OUTAGES_LOCK,
     AGENT_STATUS_OVERDUE,
+    FILE_TRANSFER_SESSION_RETENTION_HOURS,
     CheckStatus,
     DebugLogType,
+    FileTransferOperation,
+    FileTransferStatus,
 )
 from tacticalrmm.helpers import rand_range
 from tacticalrmm.utils import redis_lock
@@ -256,6 +259,54 @@ def prune_agent_history(older_than_days: int) -> str:
     ).delete()
 
     return "ok"
+
+
+@app.task
+def cleanup_expired_file_transfers_task() -> str:
+    from .file_transfer_relay import (
+        clear_download_session_redis,
+        clear_upload_session_redis,
+    )
+    from .models import FileTransferSession
+
+    def _clear_redis(session: "FileTransferSession") -> None:
+        if session.operation == FileTransferOperation.UPLOAD:
+            clear_upload_session_redis(session.session_id)
+        else:
+            clear_download_session_redis(session.session_id)
+
+    now = djangotime.now()
+
+    expired_count = 0
+    active_sessions = FileTransferSession.objects.filter(
+        status__in=(
+            FileTransferStatus.INITIALIZING,
+            FileTransferStatus.WAITING_FOR_AGENT,
+            FileTransferStatus.AGENT_READY,
+            FileTransferStatus.TRANSFERRING,
+        ),
+        expires_at__lte=now,
+    )
+    for session in active_sessions.iterator():
+        _clear_redis(session)
+        session.status = FileTransferStatus.EXPIRED
+        session.error_message = session.error_message or "Session expired"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        expired_count += 1
+
+    retention_cutoff = now - dt.timedelta(hours=FILE_TRANSFER_SESSION_RETENTION_HOURS)
+    old_terminal = FileTransferSession.objects.filter(
+        status__in=(
+            FileTransferStatus.COMPLETED,
+            FileTransferStatus.FAILED,
+            FileTransferStatus.EXPIRED,
+            FileTransferStatus.CANCELLED,
+        ),
+        updated_at__lt=retention_cutoff,
+    )
+    deleted_count, _ = old_terminal.delete()
+
+    return f"expired={expired_count} deleted={deleted_count}"
 
 
 @app.task

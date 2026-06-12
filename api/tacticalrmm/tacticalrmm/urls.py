@@ -1,4 +1,7 @@
+import os
+
 from django.conf import settings
+from django.http import HttpResponse
 from django.urls import include, path, register_converter
 from knox import views as knox_views
 
@@ -7,6 +10,18 @@ from agents.consumers import CommandStreamConsumer, TerminalStreamConsumer
 from core.consumers import DashInfo, TerminalConsumer
 from core.views import home
 from ee.sso.urls import allauth_urls
+
+
+def _file_transfer_demo(request):
+    """Serve the file-transfer HTML demo from the repo root (dev only)."""
+    html_path = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "demo.html")
+    )
+    try:
+        with open(html_path, "r", encoding="utf-8") as fh:
+            return HttpResponse(fh.read(), content_type="text/html; charset=utf-8")
+    except FileNotFoundError:
+        return HttpResponse(f"demo.html not found at {html_path}", status=404)
 
 
 class AgentIDConverter:
@@ -66,6 +81,7 @@ if getattr(settings, "ADMIN_ENABLED", False):
 
 if getattr(settings, "DEBUG", False) and not getattr(settings, "DEMO", False):
     urlpatterns += [path("silk/", include("silk.urls", namespace="silk"))]
+    urlpatterns += [path("file-transfer-demo/", _file_transfer_demo)]
 
 if getattr(settings, "SWAGGER_ENABLED", False):
     from drf_spectacular.views import SpectacularAPIView, SpectacularSwaggerView

@@ -1,3 +1,4 @@
+import datetime as dt
 import logging
 import time
 
@@ -14,6 +15,7 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
     FILE_TRANSFER_ACK_WAIT_SECONDS,
     FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS,
+    FILE_TRANSFER_SESSION_TTL_HOURS,
     TRMM_MAX_REQUEST_SIZE,
     FileTransferOperation,
     FileTransferStatus,
@@ -150,6 +152,7 @@ class FileTransferAck(APIView):
                 "pending_chunk_end",
                 "pending_chunk_created_at",
                 "last_ack_at",
+                "expires_at",
                 "updated_at",
             ]
             session.committed_offset = committed_offset
@@ -157,6 +160,9 @@ class FileTransferAck(APIView):
             session.pending_chunk_end = None
             session.pending_chunk_created_at = None
             session.last_ack_at = now
+            session.expires_at = now + dt.timedelta(
+                hours=FILE_TRANSFER_SESSION_TTL_HOURS
+            )
             if session.status == FileTransferStatus.AGENT_READY:
                 session.status = FileTransferStatus.TRANSFERRING
                 update_fields.append("status")

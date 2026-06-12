@@ -15,7 +15,7 @@ from django.utils import timezone as djangotime
 from django.utils.dateparse import parse_datetime
 from meshctrl.utils import get_login_token
 from packaging import version as pyver
-from rest_framework import serializers
+from rest_framework import serializers, status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAuthenticated
@@ -47,6 +47,8 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_CHUNK_SIZE_MAX,
     FILE_TRANSFER_CHUNK_SIZE_MIN,
+    FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
+    FILE_TRANSFER_MAX_SESSIONS_PER_USER,
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FileTransferOperation,
     FileTransferStatus,
@@ -1657,12 +1659,149 @@ def modify_registry_value(request, agent_id):
     )
 
 
+_FILE_TRANSFER_ACTIVE_STATUSES = (
+    FileTransferStatus.INITIALIZING,
+    FileTransferStatus.WAITING_FOR_AGENT,
+    FileTransferStatus.AGENT_READY,
+    FileTransferStatus.TRANSFERRING,
+)
+
+
+def enforce_file_transfer_session_limits(agent, user):
+    base = FileTransferSession.objects.filter(
+        status__in=_FILE_TRANSFER_ACTIVE_STATUSES,
+        expires_at__gt=djangotime.now(),
+    )
+
+    if (
+        FILE_TRANSFER_MAX_SESSIONS_PER_AGENT > 0
+        and base.filter(agent=agent).count() >= FILE_TRANSFER_MAX_SESSIONS_PER_AGENT
+    ):
+        return Response(
+            "Too many concurrent file transfers for this agent; "
+            "wait for an in-progress transfer to finish.",
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    if (
+        FILE_TRANSFER_MAX_SESSIONS_PER_USER > 0
+        and base.filter(user=user).count() >= FILE_TRANSFER_MAX_SESSIONS_PER_USER
+    ):
+        return Response(
+            "Too many concurrent file transfers for this user; "
+            "wait for an in-progress transfer to finish.",
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+
+    return None
+
+
+_FILE_TRANSFER_RESUMABLE_STATUSES = (
+    FileTransferStatus.WAITING_FOR_AGENT,
+    FileTransferStatus.AGENT_READY,
+    FileTransferStatus.TRANSFERRING,
+)
+
+
+def _resume_file_upload(request, agent, session_id):
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.UPLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Upload session has expired and cannot be resumed")
+
+    if session.status not in _FILE_TRANSFER_RESUMABLE_STATUSES:
+        return notify_error(
+            f"Upload session cannot be resumed (status: {session.status})"
+        )
+
+    filename = (request.data.get("filename") or "").strip()
+    if filename and filename != session.filename:
+        return notify_error("filename does not match the session being resumed")
+    raw_total = request.data.get("total_size")
+    if raw_total is not None:
+        try:
+            if int(raw_total) != session.total_size:
+                return notify_error(
+                    "total_size does not match the session being resumed"
+                )
+        except (TypeError, ValueError):
+            return notify_error("total_size must be a positive integer")
+
+    redis_committed = get_upload_ack(session.session_id)
+    resume_offset = max(session.committed_offset, redis_committed or 0)
+
+    prepare_payload = {
+        "session_id": str(session.session_id),
+        "destination_path": session.destination_path,
+        "filename": session.filename,
+        "total_size": str(session.total_size),
+        "chunk_size": str(session.chunk_size),
+        "resume": "true",
+        "committed_offset": str(resume_offset),
+    }
+    response = send_nats_command(
+        agent, "files_upload_prepare", prepare_payload, timeout=30
+    )
+
+    if isinstance(response, Response):
+        return response
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+    if response.get("status") != "ready":
+        error_message = response.get("error") or "Agent failed to resume upload"
+        return notify_error(str(error_message))
+
+    try:
+        committed_offset = int(response.get("committed_offset", resume_offset))
+    except (TypeError, ValueError):
+        return notify_error("Invalid committed_offset from agent")
+    if committed_offset < 0 or committed_offset > session.total_size:
+        return notify_error("Invalid committed_offset from agent")
+
+    clear_upload_session_redis(session.session_id)
+
+    session.status = FileTransferStatus.AGENT_READY
+    session.committed_offset = committed_offset
+    session.expires_at = djangotime.now() + dt.timedelta(
+        hours=FILE_TRANSFER_SESSION_TTL_HOURS
+    )
+    session.save(
+        update_fields=["status", "committed_offset", "expires_at", "updated_at"]
+    )
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "chunk_size": session.chunk_size,
+            "committed_offset": session.committed_offset,
+            "resumed": True,
+        }
+    )
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated, AgentFileBrowserPerms])
 def init_file_upload(request, agent_id):
     agent = get_validated_agent(agent_id)
     if isinstance(agent, Response):
         return agent
+
+    resume_session_id = (request.data.get("session_id") or "").strip()
+    if resume_session_id:
+        return _resume_file_upload(request, agent, resume_session_id)
+
+    limit_err = enforce_file_transfer_session_limits(agent, request.user)
+    if limit_err is not None:
+        return limit_err
 
     filename = (request.data.get("filename") or "").strip()
     destination_path = (request.data.get("destination_path") or "").strip()
@@ -1997,6 +2136,10 @@ def complete_file_upload(request, agent_id, session_id):
         "destination_path": session.destination_path,
         "total_size": str(session.total_size),
     }
+
+    client_sha256 = (request.data.get("sha256") or "").strip().lower()
+    if client_sha256:
+        finalize_payload["sha256"] = client_sha256
     response = send_nats_command(
         agent, "files_upload_finalize", finalize_payload, timeout=30
     )
@@ -2030,6 +2173,88 @@ def complete_file_upload(request, agent_id, session_id):
             "status": session.status,
             "destination_path": session.destination_path,
             "committed_offset": committed_offset,
+            "sha256": response.get("sha256", ""),
+        }
+    )
+
+
+def _resume_file_download(request, agent, session_id):
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+    )
+
+    if session.expires_at <= djangotime.now():
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+        return notify_error("Download session has expired and cannot be resumed")
+
+    if session.status not in _FILE_TRANSFER_RESUMABLE_STATUSES:
+        return notify_error(
+            f"Download session cannot be resumed (status: {session.status})"
+        )
+
+    try:
+        resume_offset = int(request.data.get("resume_offset", session.committed_offset))
+    except (TypeError, ValueError):
+        return notify_error("resume_offset must be a non-negative integer")
+
+    if resume_offset < 0 or resume_offset > session.total_size:
+        return notify_error("resume_offset is out of range")
+    if resume_offset % session.chunk_size != 0 and resume_offset != session.total_size:
+        return notify_error("resume_offset must be aligned to chunk_size")
+
+    prepare_payload = {
+        "session_id": str(session.session_id),
+        "source_path": session.destination_path,
+        "chunk_size": str(session.chunk_size),
+        "resume": "true",
+        "committed_offset": str(resume_offset),
+    }
+    response = send_nats_command(
+        agent, "files_download_prepare", prepare_payload, timeout=30
+    )
+
+    if isinstance(response, Response):
+        return response
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+    if response.get("status") != "ready":
+        error_message = response.get("error") or "Agent failed to resume download"
+        return notify_error(str(error_message))
+
+    try:
+        total_size = int(response.get("total_size", 0))
+    except (TypeError, ValueError):
+        return notify_error("Invalid total_size from agent")
+
+    if total_size != session.total_size:
+        return notify_error(
+            "Source file changed since the transfer started; cannot resume"
+        )
+
+    clear_download_session_redis(session.session_id)
+
+    session.status = FileTransferStatus.AGENT_READY
+    session.committed_offset = resume_offset
+    session.expires_at = djangotime.now() + dt.timedelta(
+        hours=FILE_TRANSFER_SESSION_TTL_HOURS
+    )
+    session.save(
+        update_fields=["status", "committed_offset", "expires_at", "updated_at"]
+    )
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "total_size": total_size,
+            "chunk_size": session.chunk_size,
+            "committed_offset": resume_offset,
+            "resumed": True,
         }
     )
 
@@ -2040,6 +2265,14 @@ def init_file_download(request, agent_id):
     agent = get_validated_agent(agent_id)
     if isinstance(agent, Response):
         return agent
+
+    resume_session_id = (request.data.get("session_id") or "").strip()
+    if resume_session_id:
+        return _resume_file_download(request, agent, resume_session_id)
+
+    limit_err = enforce_file_transfer_session_limits(agent, request.user)
+    if limit_err is not None:
+        return limit_err
 
     source_path = (request.data.get("source_path") or "").strip()
     path_err = validate_file_transfer_destination_path(source_path, agent.plat)
@@ -2253,6 +2486,7 @@ def ack_file_download_chunk(request, agent_id, session_id):
             "pending_chunk_end",
             "pending_chunk_created_at",
             "last_ack_at",
+            "expires_at",
             "updated_at",
         ]
         session.committed_offset = committed_offset
@@ -2260,6 +2494,7 @@ def ack_file_download_chunk(request, agent_id, session_id):
         session.pending_chunk_end = None
         session.pending_chunk_created_at = None
         session.last_ack_at = now
+        session.expires_at = now + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS)
         if session.status == FileTransferStatus.AGENT_READY:
             session.status = FileTransferStatus.TRANSFERRING
             update_fields.append("status")
@@ -2366,6 +2601,7 @@ def complete_file_download(request, agent_id, session_id):
             "status": session.status,
             "source_path": session.destination_path,
             "committed_offset": committed_offset,
+            "sha256": response.get("sha256", ""),
         }
     )
 

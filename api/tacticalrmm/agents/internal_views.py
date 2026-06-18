@@ -14,9 +14,10 @@ from rest_framework.views import APIView
 from tacticalrmm.constants import (
     FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
     FILE_TRANSFER_ACK_WAIT_SECONDS,
+    FILE_TRANSFER_CHUNK_SIZE_MAX,
     FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS,
+    FILE_TRANSFER_PIPELINE_DEPTH,
     FILE_TRANSFER_SESSION_TTL_HOURS,
-    TRMM_MAX_REQUEST_SIZE,
     FileTransferOperation,
     FileTransferStatus,
 )
@@ -226,7 +227,7 @@ class FileTransferDownloadPutChunk(APIView):
             except ValueError:
                 return notify_error("Invalid Content-Length header")
 
-        if expected_len > TRMM_MAX_REQUEST_SIZE:
+        if expected_len > FILE_TRANSFER_CHUNK_SIZE_MAX:
             return notify_error("Chunk exceeds maximum request size")
 
         chunk_data = request.body
@@ -244,9 +245,10 @@ class FileTransferDownloadPutChunk(APIView):
                 f"Chunk start offset {start} does not match expected {offered}"
             )
 
+        depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
         depth_wait_ms = 0.0
-        if start - committed > session.chunk_size:
-            min_committed = start - session.chunk_size
+        if start - committed > depth_bytes:
+            min_committed = start - depth_bytes
             depth_wait_t0 = time.monotonic()
             new_committed = wait_for_download_ack(
                 session.session_id,

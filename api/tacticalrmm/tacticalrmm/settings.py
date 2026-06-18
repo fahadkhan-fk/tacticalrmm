@@ -137,10 +137,16 @@ except NameError:
     TRMM_MAX_REQUEST_SIZE = 10 * 2**20
 
 try:
+    FILE_TRANSFER_CHUNK_SIZE_MAX
+except NameError:
+    FILE_TRANSFER_CHUNK_SIZE_MAX = 16 * 2**20
+
+try:
     DATA_UPLOAD_MAX_MEMORY_SIZE
 except NameError:
-    # Django enforces this before views run; must be >= FILE_TRANSFER_CHUNK_SIZE (4 MiB).
-    DATA_UPLOAD_MAX_MEMORY_SIZE = TRMM_MAX_REQUEST_SIZE
+    DATA_UPLOAD_MAX_MEMORY_SIZE = max(
+        TRMM_MAX_REQUEST_SIZE, FILE_TRANSFER_CHUNK_SIZE_MAX + 2**20
+    )
 
 if "GHACTIONS" in os.environ:
     print("-----------------------GHACTIONS----------------------------")

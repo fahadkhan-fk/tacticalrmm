@@ -11,9 +11,13 @@ from django.core.checks import Error, register
 
 @register()
 def file_transfer_timeout_ladder_check(app_configs, **kwargs):
+    from django.conf import settings
+
     from tacticalrmm.constants import (
         FILE_TRANSFER_ACK_WAIT_SECONDS,
+        FILE_TRANSFER_CHUNK_SIZE_MAX,
         FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS,
+        FILE_TRANSFER_PIPELINE_DEPTH,
         FILE_TRANSFER_REDIS_CHUNK_TTL_SECONDS,
     )
 
@@ -44,6 +48,31 @@ def file_transfer_timeout_ladder_check(app_configs, **kwargs):
                     f"DL_DEPTH_WAIT={FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS}"
                 ),
                 id="agents.E002",
+            )
+        )
+
+    data_upload_max = getattr(settings, "DATA_UPLOAD_MAX_MEMORY_SIZE", None)
+    if data_upload_max is not None and data_upload_max < FILE_TRANSFER_CHUNK_SIZE_MAX:
+        errors.append(
+            Error(
+                "DATA_UPLOAD_MAX_MEMORY_SIZE must be >= FILE_TRANSFER_CHUNK_SIZE_MAX "
+                "so the largest negotiated chunk body is not rejected by Django "
+                "before the view runs.",
+                hint=(
+                    f"DATA_UPLOAD_MAX_MEMORY_SIZE={data_upload_max}, "
+                    f"FILE_TRANSFER_CHUNK_SIZE_MAX={FILE_TRANSFER_CHUNK_SIZE_MAX}"
+                ),
+                id="agents.E003",
+            )
+        )
+
+    if FILE_TRANSFER_PIPELINE_DEPTH < 1:
+        errors.append(
+            Error(
+                "FILE_TRANSFER_PIPELINE_DEPTH must be >= 1 (the sender must be "
+                "allowed at least one chunk in flight).",
+                hint=f"FILE_TRANSFER_PIPELINE_DEPTH={FILE_TRANSFER_PIPELINE_DEPTH}",
+                id="agents.E004",
             )
         )
 

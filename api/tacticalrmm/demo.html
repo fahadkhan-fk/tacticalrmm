@@ -210,7 +210,8 @@ hr.div { border:none; border-top:1px solid #334155; margin:1rem 0; }
   </div><!-- /grid-2 -->
 
   <p style="text-align:center;color:#334155;font-size:0.72rem;margin-top:2rem">
-    depth-1-prefetch upload · agent-stream-concurrent-ack download
+    pipelined upload (server pipeline depth 4) · agent-stream-concurrent-ack download<br>
+    <strong>In-flight</strong> = accepted − committed (up to ~4× chunk size).
   </p>
 </div>
 

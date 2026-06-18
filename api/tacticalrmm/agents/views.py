@@ -47,12 +47,12 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_CHUNK_SIZE_MAX,
     FILE_TRANSFER_CHUNK_SIZE_MIN,
+    FILE_TRANSFER_PIPELINE_DEPTH,
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
     FILE_TRANSFER_MAX_SESSIONS_PER_USER,
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FileTransferOperation,
     FileTransferStatus,
-    TRMM_MAX_REQUEST_SIZE,
     AgentHistoryType,
     AgentMonType,
     AgentPlat,
@@ -1977,7 +1977,7 @@ def upload_file_chunk(request, agent_id, session_id):
         except ValueError:
             return notify_error("Invalid Content-Length header")
 
-    if expected_len > TRMM_MAX_REQUEST_SIZE:
+    if expected_len > FILE_TRANSFER_CHUNK_SIZE_MAX:
         return notify_error("Chunk exceeds maximum request size")
 
     chunk_data = request.body
@@ -1995,9 +1995,10 @@ def upload_file_chunk(request, agent_id, session_id):
             f"Chunk start offset {start} does not match expected {accepted}"
         )
 
+    depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
     depth_wait_ms = 0.0
-    if start - committed > session.chunk_size:
-        min_committed = start - session.chunk_size
+    if start - committed > depth_bytes:
+        min_committed = start - depth_bytes
         depth_wait_t0 = time.monotonic()
         new_committed = wait_for_upload_ack(
             session.session_id,

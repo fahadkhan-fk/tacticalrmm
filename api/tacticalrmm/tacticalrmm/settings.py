@@ -312,7 +312,7 @@ def _silky_intercept(request) -> bool:
     path = request.path
     if "/files/upload/" in path and path.endswith("/chunk/"):
         return False
-    if "/api/internal/file-transfers/" in path:
+    if "/api/v3/file-transfers/" in path:
         return False
     return True
 

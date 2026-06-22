@@ -11,19 +11,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from tacticalrmm.constants import (
-    FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
-    FILE_TRANSFER_ACK_WAIT_SECONDS,
-    FILE_TRANSFER_CHUNK_SIZE_MAX,
-    FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS,
-    FILE_TRANSFER_PIPELINE_DEPTH,
-    FILE_TRANSFER_SESSION_TTL_HOURS,
-    FileTransferOperation,
-    FileTransferStatus,
-)
-from tacticalrmm.helpers import notify_error
-
-from .file_transfer_relay import (
+from agents.file_transfer_relay import (
     get_accepted_offset,
     get_download_ack,
     get_download_offered_offset,
@@ -33,8 +21,18 @@ from .file_transfer_relay import (
     store_download_chunk,
     wait_for_download_ack,
 )
-from .models import FileTransferSession
-from .utils import parse_upload_content_range
+from agents.models import FileTransferSession
+from agents.utils import parse_upload_content_range
+from tacticalrmm.constants import (
+    FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
+    FILE_TRANSFER_CHUNK_SIZE_MAX,
+    FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS,
+    FILE_TRANSFER_PIPELINE_DEPTH,
+    FILE_TRANSFER_SESSION_TTL_HOURS,
+    FileTransferOperation,
+    FileTransferStatus,
+)
+from tacticalrmm.helpers import notify_error
 
 logger = logging.getLogger("trmm_file_transfer")
 

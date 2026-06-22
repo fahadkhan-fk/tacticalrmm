@@ -61,7 +61,6 @@ if not getattr(settings, "DEMO", False):
     urlpatterns += (
         path("api/v3/", include("apiv3.urls")),
         path("api/v4/", include("apiv4.urls")),
-        path("api/internal/", include("agents.internal_urls")),
         path("reporting/", include("ee.reporting.urls")),
     )
 

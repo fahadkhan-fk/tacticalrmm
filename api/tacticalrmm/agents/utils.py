@@ -313,3 +313,46 @@ def parse_upload_content_range(
         return None, "Content-Range exceeds file size"
 
     return (start, end), None
+
+
+def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
+    return validate_file_transfer_destination_path(path, plat)
+
+
+def normalize_file_browser_items(raw_items) -> list:
+    if not isinstance(raw_items, list):
+        return []
+
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+
+        item_type = raw.get("type")
+        if item_type not in ("file", "folder"):
+            continue
+
+        name = (raw.get("name") or "").strip()
+        path = (raw.get("path") or "").strip()
+        if not name or not path:
+            continue
+
+        item = {
+            "id": str(raw.get("id") or path),
+            "name": name,
+            "path": path,
+            "type": item_type,
+            "size": str(raw.get("size") or "0"),
+            "modified": raw.get("modified") or "",
+            "created": raw.get("created") or "",
+            "accessed": raw.get("accessed") or "",
+            "hidden": bool(raw.get("hidden", False)),
+            "system": bool(raw.get("system", False)),
+            "readonly": bool(raw.get("readonly", False)),
+        }
+        extension = raw.get("extension")
+        if extension:
+            item["extension"] = str(extension)
+        items.append(item)
+
+    return items

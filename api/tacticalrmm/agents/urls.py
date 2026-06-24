@@ -84,6 +84,11 @@ urlpatterns = [
     ),
     path("<agent:agent_id>/terminal-defaults/", views.AgentTerminalDefaults.as_view()),
     path(
+        "<agent:agent_id>/files/",
+        views.list_files,
+        name="list_files",
+    ),
+    path(
         "<agent:agent_id>/files/upload/init/",
         views.init_file_upload,
         name="init_file_upload",

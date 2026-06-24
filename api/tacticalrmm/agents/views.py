@@ -51,6 +51,8 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
     FILE_TRANSFER_MAX_SESSIONS_PER_USER,
     FILE_TRANSFER_SESSION_TTL_HOURS,
+    FILE_BROWSER_DEFAULT_PAGE_SIZE,
+    FILE_BROWSER_MAX_PAGE_SIZE,
     FileTransferOperation,
     FileTransferStatus,
     AgentHistoryType,
@@ -131,10 +133,12 @@ from .file_transfer_relay import (
 )
 from .utils import (
     get_validated_agent,
+    normalize_file_browser_items,
     parse_upload_content_range,
     resolve_upload_destination_path,
     send_nats_command,
     send_nats_notification,
+    validate_file_browser_path,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
 )
@@ -1784,6 +1788,66 @@ def _resume_file_upload(request, agent, session_id):
             "chunk_size": session.chunk_size,
             "committed_offset": session.committed_offset,
             "resumed": True,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def list_files(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.query_params.get("path") or "").strip()
+    if not path:
+        return notify_error("path is required")
+
+    path_err = validate_file_browser_path(path, agent.plat)
+    if path_err:
+        return notify_error(path_err)
+
+    try:
+        page = int(request.query_params.get("page", 1))
+        page_size = int(
+            request.query_params.get("page_size", FILE_BROWSER_DEFAULT_PAGE_SIZE)
+        )
+    except ValueError:
+        return notify_error("page and page_size must be integers")
+
+    if page < 1:
+        return notify_error("page must be >= 1")
+    if page_size < 1 or page_size > FILE_BROWSER_MAX_PAGE_SIZE:
+        return notify_error(
+            f"page_size must be between 1 and {FILE_BROWSER_MAX_PAGE_SIZE}"
+        )
+
+    payload = {
+        "path": path,
+        "page": str(page),
+        "page_size": str(page_size),
+    }
+    response = send_nats_command(agent, "files_list", payload, timeout=30)
+    if isinstance(response, Response):
+        return response
+
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+
+    items = normalize_file_browser_items(response.get("items", []))
+    try:
+        total = int(response.get("total", len(items)))
+    except (TypeError, ValueError):
+        total = len(items)
+
+    return Response(
+        {
+            "path": response.get("path", path),
+            "items": items,
+            "has_more": bool(response.get("has_more", False)),
+            "page": page,
+            "page_size": page_size,
+            "total": total,
         }
     )
 

@@ -356,3 +356,8 @@ def normalize_file_browser_items(raw_items) -> list:
         items.append(item)
 
     return items
+
+
+def normalize_file_browser_item(raw) -> Optional[dict]:
+    items = normalize_file_browser_items([raw] if raw is not None else [])
+    return items[0] if items else None

@@ -89,6 +89,11 @@ urlpatterns = [
         name="list_files",
     ),
     path(
+        "<agent:agent_id>/files/properties/",
+        views.get_file_properties,
+        name="get_file_properties",
+    ),
+    path(
         "<agent:agent_id>/files/upload/init/",
         views.init_file_upload,
         name="init_file_upload",

@@ -133,6 +133,7 @@ from .file_transfer_relay import (
 )
 from .utils import (
     get_validated_agent,
+    normalize_file_browser_item,
     normalize_file_browser_items,
     parse_upload_content_range,
     resolve_upload_destination_path,
@@ -1850,6 +1851,35 @@ def list_files(request, agent_id):
             "total": total,
         }
     )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def get_file_properties(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.query_params.get("path") or "").strip()
+    if not path:
+        return notify_error("path is required")
+
+    path_err = validate_file_browser_path(path, agent.plat)
+    if path_err:
+        return notify_error(path_err)
+
+    response = send_nats_command(agent, "files_properties", {"path": path}, timeout=30)
+    if isinstance(response, Response):
+        return response
+
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+
+    item = normalize_file_browser_item(response)
+    if not item:
+        return notify_error("Invalid agent response")
+
+    return Response(item)
 
 
 @api_view(["POST"])

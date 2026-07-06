@@ -228,6 +228,25 @@ _INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*\x00')
 _WINDOWS_ABS_PATH_RE = re.compile(r"^(?:[a-zA-Z]:\\|\\\\[^\\]+\\[^\\]+)")
 
 
+def validate_file_browser_name(raw_name, field: str = "name") -> Optional[str]:
+    """Validate a single file or folder name segment (mkdir / rename)."""
+    if raw_name is None or not str(raw_name).strip():
+        return f"{field} is required"
+
+    name = str(raw_name)
+    if name.endswith(" ") or name.endswith("."):
+        return f"{field} cannot end with a space or a period"
+
+    trimmed = name.strip()
+    if trimmed in (".", ".."):
+        return f"{field} is invalid"
+    if len(trimmed) > 255:
+        return f"{field} is too long"
+    if any(ch in _INVALID_FILENAME_CHARS for ch in trimmed):
+        return f"{field} contains invalid characters"
+    return None
+
+
 def validate_file_transfer_filename(filename: str) -> Optional[str]:
     name = (filename or "").strip()
     if not name:
@@ -316,7 +335,39 @@ def parse_upload_content_range(
 
 
 def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
-    return validate_file_transfer_destination_path(path, plat)
+    value = normalize_file_browser_path(path, plat)
+    if not value:
+        return "path is required"
+    if any(x in value for x in ("\n", "\r", "\x00")):
+        return "path contains invalid characters"
+    if _path_has_traversal(value):
+        return "path must not contain path traversal"
+
+    if plat == "windows":
+        if not _WINDOWS_ABS_PATH_RE.match(value):
+            return "path must be an absolute Windows path"
+        return None
+
+    if not value.startswith("/"):
+        return "path must be an absolute path"
+    return None
+
+
+def normalize_file_browser_path(path: str, plat: str) -> str:
+    value = (path or "").strip()
+    if not value:
+        return value
+
+    if plat == "windows":
+        value = value.replace("/", "\\")
+        if re.match(r"^[A-Za-z]:\\*$", value):
+            return value if value.endswith("\\") else f"{value}\\"
+        return value
+
+    value = value.replace("\\", "/")
+    if value != "/":
+        value = value.rstrip("/")
+    return value or "/"
 
 
 def normalize_file_browser_items(raw_items) -> list:
@@ -361,3 +412,44 @@ def normalize_file_browser_items(raw_items) -> list:
 def normalize_file_browser_item(raw) -> Optional[dict]:
     items = normalize_file_browser_items([raw] if raw is not None else [])
     return items[0] if items else None
+
+
+FILE_BROWSER_MAX_DELETE_PATHS = 100
+
+
+def validate_file_browser_paths(paths, plat: str) -> Optional[str]:
+    if not isinstance(paths, list) or not paths:
+        return "paths is required"
+    if len(paths) > FILE_BROWSER_MAX_DELETE_PATHS:
+        return f"paths must not exceed {FILE_BROWSER_MAX_DELETE_PATHS} items"
+
+    for path in paths:
+        if not isinstance(path, str) or not path.strip():
+            return "paths must be non-empty strings"
+        path_err = validate_file_browser_path(path.strip(), plat)
+        if path_err:
+            return path_err
+    return None
+
+
+def normalize_file_browser_delete_results(raw_results) -> list:
+    if not isinstance(raw_results, list):
+        return []
+
+    results = []
+    for raw in raw_results:
+        if not isinstance(raw, dict):
+            continue
+
+        path = (raw.get("path") or "").strip()
+        if not path:
+            continue
+
+        entry = {
+            "path": path,
+            "success": bool(raw.get("success", False)),
+        }
+        if raw.get("error"):
+            entry["error"] = str(raw["error"])
+        results.append(entry)
+    return results

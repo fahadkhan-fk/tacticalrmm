@@ -160,7 +160,10 @@ hr.div { border:none; border-top:1px solid #334155; margin:1rem 0; }
         </div>
         <div class="log-wrap">
           <table class="chunk-tbl">
-            <thead><tr><th>#</th><th>Range</th><th>PUT</th><th>Speed</th><th>In-flight</th></tr></thead>
+            <thead><tr>
+              <th>#</th><th>Range</th><th>Client PUT</th>
+              <th>Speed</th><th>In-flight</th>
+            </tr></thead>
             <tbody id="up-log"></tbody>
           </table>
         </div>
@@ -199,7 +202,10 @@ hr.div { border:none; border-top:1px solid #334155; margin:1rem 0; }
         </div>
         <div class="log-wrap">
           <table class="chunk-tbl">
-            <thead><tr><th>#</th><th>Range</th><th>GET</th><th>ACK wait</th><th>Speed</th></tr></thead>
+            <thead><tr>
+              <th>#</th><th>Range</th><th>Client GET</th>
+              <th>ACK wait</th><th>Speed</th>
+            </tr></thead>
             <tbody id="dl-log"></tbody>
           </table>
         </div>
@@ -210,11 +216,13 @@ hr.div { border:none; border-top:1px solid #334155; margin:1rem 0; }
   </div><!-- /grid-2 -->
 
   <p style="text-align:center;color:#334155;font-size:0.72rem;margin-top:2rem">
-    pipelined upload (server pipeline depth 4) · agent-stream-concurrent-ack download<br>
-    <strong>In-flight</strong> = accepted − committed (up to ~4× chunk size).
+    pipelined upload (server pipeline depth 4) · agent-stream-concurrent-ack download · SHA-256 integrity on complete<br>
+    Server-side per-chunk timings are in Django logs (<code>grep file_transfer</code>); this page shows client wall-clock only.<br>
+    <strong>In-flight</strong> = accepted − committed (bytes the server has but the agent has not committed yet; up to ~4× chunk size).
   </p>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/js-sha256@0.11.0/src/sha256.min.js"></script>
 <script>
 'use strict';
 
@@ -289,6 +297,15 @@ async function ensurePermission(handle) {
   if ((await handle.queryPermission(opts))   === 'granted') return true;
   if ((await handle.requestPermission(opts)) === 'granted') return true;
   return false;
+}
+
+async function hashBlobPrefix(blob, endOffset, blockSize, hasher) {
+  let pos = 0;
+  while (pos < endOffset) {
+    const slice = blob.slice(pos, Math.min(pos + blockSize, endOffset));
+    hasher.update(new Uint8Array(await slice.arrayBuffer()));
+    pos += slice.size;
+  }
 }
 
 // ── upload ─────────────────────────────────────────────────────────────────
@@ -371,8 +388,10 @@ async function startUpload() {
     const total  = upFile.size;
     const nChunks = Math.ceil(total / chunkSz);
     let chunkNum  = Math.floor(offset / chunkSz);
+    const upHasher = sha256.create();
     if (offset > 0) {
       bytesDone = offset;
+      await hashBlobPrefix(upFile, offset, chunkSz, upHasher);
       document.getElementById('up-bar').style.width = `${Math.round((offset / total) * 100)}%`;
       const tr = document.createElement('tr');
       tr.innerHTML = `<td colspan="5" style="color:#fbbf24">↻ Resumed at ${fmtBytes(offset)} (${Math.round((offset / total) * 100)}%)</td>`;
@@ -386,6 +405,7 @@ async function startUpload() {
       const end   = offset + blob.size - 1;
       const ct0   = performance.now();
       document.getElementById('up-status').textContent = `Chunk ${chunkNum} / ${nChunks}…`;
+      upHasher.update(new Uint8Array(await blob.arrayBuffer()));
 
       const r = await fetch(`${c.base}/agents/${c.agent}/files/upload/${sessionId}/chunk/`, {
         method: 'PUT', signal: sig,
@@ -396,11 +416,11 @@ async function startUpload() {
       const d = await r.json();
 
       const putSec = (performance.now() - ct0) / 1000;
-      const speed  = blob.size / putSec;
       offset    = d.accepted_offset;
       bytesDone = offset;
       const inFlight = offset - d.committed_offset;
       const pct = Math.round((offset / total) * 100);
+      const speed = blob.size / putSec;
 
       document.getElementById('up-bar').style.width   = `${pct}%`;
       document.getElementById('up-pct').textContent   = `${pct}%`;
@@ -411,7 +431,7 @@ async function startUpload() {
       tr.innerHTML = `
         <td>${chunkNum}</td>
         <td>${fmtBytes(offset - blob.size)} – ${fmtBytes(end)}</td>
-        <td>${putSec.toFixed(2)}s</td>
+        <td>${(putSec * 1000).toFixed(0)}ms</td>
         <td>${fmtSpeed(speed)}</td>
         <td>${fmtBytes(inFlight)}</td>`;
       const log = document.getElementById('up-log');
@@ -419,20 +439,25 @@ async function startUpload() {
       log.closest('.log-wrap').scrollTop = 9999;
     }
 
-    // 3. Complete
+    // 3. Complete — send SHA-256 so the agent verifies before rename
     document.getElementById('up-status').textContent = 'Completing…';
+    const fileSha256 = upHasher.hex();
     const cr = await fetch(`${c.base}/agents/${c.agent}/files/upload/${sessionId}/complete/`, {
-      method: 'POST', signal: sig, headers: hdrs(c),
+      method: 'POST', signal: sig, headers: jsonHdrs(c),
+      body: JSON.stringify({ sha256: fileSha256 }),
     });
     if (!cr.ok) throw new Error(`Complete ${cr.status}: ${await cr.text()}`);
     const cd = await cr.json();
+    const agentSha = (cd.sha256 || '').toLowerCase();
+    const integrityOk = !agentSha || agentSha === fileSha256;
 
     clearUpResume(c, upFile);  // finished — drop resume state
     document.getElementById('up-bar').style.width = '100%';
     document.getElementById('up-bar').classList.add('done');
     document.getElementById('up-pct').textContent    = '100%';
     document.getElementById('up-status').textContent = `✓ ${cd.status}`;
-    setAlert('up-alert', `✓ Uploaded ${upFile.name} → ${cd.destination_path}`, 'ok');
+    const integrityNote = integrityOk ? ' · integrity ✓' : ' · integrity ✗ (digest mismatch)';
+    setAlert('up-alert', `✓ Uploaded ${upFile.name} → ${cd.destination_path}${integrityNote}`, integrityOk ? 'ok' : 'err');
 
   } catch (e) {
     // On stop/error we deliberately do NOT finalize: the session stays
@@ -576,12 +601,21 @@ async function startDownload() {
     let committedOffset = id.committed_offset || resumeOffset || 0;
     let chunkNum        = Math.floor(committedOffset / chunkSz);
     let prevAck         = null;
+    const dlHasher      = sha256.create();
 
     // Persist resume metadata + handle so a reload can continue this download.
     if (fileHandle) await idbPut(handleKey, fileHandle).catch(() => {});
     saveDlResume(c, srcPath, { sessionId, chunkSize: chunkSz, totalSize });
 
     if (committedOffset > 0) {
+      if (fileHandle) {
+        const existing = await fileHandle.getFile();
+        await hashBlobPrefix(existing, committedOffset, chunkSz, dlHasher);
+      } else if (buffers && buffers.length) {
+        for (const part of buffers) {
+          dlHasher.update(new Uint8Array(part));
+        }
+      }
       document.getElementById('dl-bar').style.width = `${Math.round((committedOffset / totalSize) * 100)}%`;
       const tr = document.createElement('tr');
       tr.innerHTML = `<td colspan="5" style="color:#fbbf24">↻ Resumed at ${fmtBytes(committedOffset)} (${Math.round((committedOffset / totalSize) * 100)}%)</td>`;
@@ -601,6 +635,7 @@ async function startDownload() {
       );
       if (!r.ok) throw new Error(`Chunk ${chunkNum} GET ${r.status}: ${await r.text()}`);
       const buf     = await r.arrayBuffer();
+      dlHasher.update(new Uint8Array(buf));
       const getSec  = (performance.now() - gt0) / 1000;
       const { end } = parseRange(r.headers.get('Content-Range') || '');
       const newCommit = end + 1;
@@ -635,9 +670,9 @@ async function startDownload() {
       bytesDone       = committedOffset;
 
       const chunkBytes = buf.byteLength;
-      const speed = chunkBytes / getSec;
       const pct   = Math.round((committedOffset / totalSize) * 100);
       totalAckWait += ackWaitSec;
+      const speed = chunkBytes / getSec;
 
       document.getElementById('dl-bar').style.width       = `${pct}%`;
       document.getElementById('dl-pct').textContent       = `${pct}%`;
@@ -650,7 +685,7 @@ async function startDownload() {
       tr.innerHTML = `
         <td>${chunkNum}</td>
         <td>${fmtBytes(committedOffset - chunkBytes)} – ${fmtBytes(end)}</td>
-        <td>${getSec.toFixed(2)}s</td>
+        <td>${(getSec * 1000).toFixed(0)}ms</td>
         <td><span class="badge ${ackMs > 50 ? 'slow' : 'ok'}">${ackMs} ms</span></td>
         <td>${fmtSpeed(speed)}</td>`;
       const log = document.getElementById('dl-log');
@@ -671,6 +706,9 @@ async function startDownload() {
     });
     if (!cr.ok) throw new Error(`Complete ${cr.status}: ${await cr.text()}`);
     const cd = await cr.json();
+    const localSha256 = dlHasher.hex();
+    const agentSha256 = (cd.sha256 || '').toLowerCase();
+    const integrityOk = !agentSha256 || agentSha256 === localSha256;
 
     clearDlResume(c, srcPath);            // finished — drop resume state
     await idbDel(handleKey).catch(() => {});
@@ -684,7 +722,8 @@ async function startDownload() {
       await writable.close();
       writable = null;
       document.getElementById('dl-status').textContent = `✓ ${cd.status}`;
-      setAlert('dl-alert', `✓ Downloaded ${filename} (${fmtBytes(bytesDone)}) — saved to your chosen location`, 'ok');
+      const integrityNote = integrityOk ? ' · integrity ✓' : ' · integrity ✗ (digest mismatch)';
+      setAlert('dl-alert', `✓ Downloaded ${filename} (${fmtBytes(bytesDone)}) — saved to your chosen location${integrityNote}`, integrityOk ? 'ok' : 'err');
     } else {
       // Fallback path: assemble blob and trigger save dialog
       document.getElementById('dl-status').textContent = '✓ Saving…';
@@ -696,7 +735,8 @@ async function startDownload() {
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 10_000);
       document.getElementById('dl-status').textContent = `✓ ${cd.status}`;
-      setAlert('dl-alert', `✓ Downloaded ${filename} (${fmtBytes(bytesDone)}) — check your Downloads folder`, 'ok');
+      const integrityNote = integrityOk ? ' · integrity ✓' : ' · integrity ✗ (digest mismatch)';
+      setAlert('dl-alert', `✓ Downloaded ${filename} (${fmtBytes(bytesDone)}) — check your Downloads folder${integrityNote}`, integrityOk ? 'ok' : 'err');
     }
 
   } catch (e) {

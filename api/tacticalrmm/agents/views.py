@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+import json
 import logging
 import random
 import string
@@ -133,13 +134,17 @@ from .file_transfer_relay import (
 )
 from .utils import (
     get_validated_agent,
+    normalize_file_browser_delete_results,
     normalize_file_browser_item,
     normalize_file_browser_items,
+    normalize_file_browser_path,
     parse_upload_content_range,
     resolve_upload_destination_path,
     send_nats_command,
     send_nats_notification,
+    validate_file_browser_name,
     validate_file_browser_path,
+    validate_file_browser_paths,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
 )
@@ -1793,9 +1798,12 @@ def _resume_file_upload(request, agent, session_id):
     )
 
 
-@api_view(["GET"])
+@api_view(["GET", "DELETE"])
 @permission_classes([IsAuthenticated, AgentFileBrowserPerms])
 def list_files(request, agent_id):
+    if request.method == "DELETE":
+        return _delete_agent_files(request, agent_id)
+
     agent = get_validated_agent(agent_id)
     if isinstance(agent, Response):
         return agent
@@ -1880,6 +1888,117 @@ def get_file_properties(request, agent_id):
         return notify_error("Invalid agent response")
 
     return Response(item)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def create_file_folder(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    path = (request.data.get("path") or "").strip()
+    raw_name = request.data.get("name")
+    if not path:
+        return notify_error("path is required")
+
+    path_err = validate_file_browser_path(path, agent.plat)
+    if path_err:
+        return notify_error(path_err)
+
+    name_err = validate_file_browser_name(raw_name, field="name")
+    if name_err:
+        return notify_error(name_err)
+
+    name = str(raw_name).strip()
+    path = normalize_file_browser_path(path, agent.plat)
+
+    response = send_nats_command(
+        agent, "files_mkdir", {"path": path, "name": name}, timeout=30
+    )
+    if isinstance(response, Response):
+        return response
+
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+
+    item = normalize_file_browser_item(response)
+    if not item:
+        return notify_error("Invalid agent response")
+
+    return Response({"status": "success", "item": item})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def rename_file(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    raw_path = (request.data.get("path") or "").strip()
+    raw_new_name = request.data.get("new_name")
+    if not raw_path:
+        return notify_error("path is required")
+
+    path_err = validate_file_browser_path(raw_path, agent.plat)
+    if path_err:
+        return notify_error(path_err)
+
+    name_err = validate_file_browser_name(raw_new_name, field="new_name")
+    if name_err:
+        return notify_error(name_err)
+
+    path = normalize_file_browser_path(raw_path, agent.plat)
+    new_name = str(raw_new_name).strip()
+
+    response = send_nats_command(
+        agent,
+        "files_rename",
+        {"path": path, "new_name": new_name},
+        timeout=30,
+    )
+    if isinstance(response, Response):
+        return response
+
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+
+    item = normalize_file_browser_item(response)
+    if not item:
+        return notify_error("Invalid agent response")
+
+    return Response({"status": "success", "item": item})
+
+
+def _delete_agent_files(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    paths = request.data.get("paths")
+    paths_err = validate_file_browser_paths(paths, agent.plat)
+    if paths_err:
+        return notify_error(paths_err)
+
+    normalized_paths = [path.strip() for path in paths]
+    response = send_nats_command(
+        agent,
+        "files_delete",
+        {"paths": json.dumps(normalized_paths)},
+        timeout=60,
+    )
+    if isinstance(response, Response):
+        return response
+
+    if not isinstance(response, dict):
+        return notify_error("Invalid agent response")
+
+    results = normalize_file_browser_delete_results(response.get("results", []))
+    if not results:
+        return notify_error("Invalid agent response")
+
+    return Response({"status": "success", "results": results})
 
 
 @api_view(["POST"])

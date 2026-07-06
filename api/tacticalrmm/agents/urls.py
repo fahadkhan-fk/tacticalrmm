@@ -94,6 +94,16 @@ urlpatterns = [
         name="get_file_properties",
     ),
     path(
+        "<agent:agent_id>/files/folder/",
+        views.create_file_folder,
+        name="create_file_folder",
+    ),
+    path(
+        "<agent:agent_id>/files/rename/",
+        views.rename_file,
+        name="rename_file",
+    ),
+    path(
         "<agent:agent_id>/files/upload/init/",
         views.init_file_upload,
         name="init_file_upload",

@@ -80,6 +80,17 @@ FILE_BROWSER_DEFAULT_PAGE_SIZE = getattr(
     settings, "FILE_BROWSER_DEFAULT_PAGE_SIZE", 500
 )
 FILE_BROWSER_MAX_PAGE_SIZE = getattr(settings, "FILE_BROWSER_MAX_PAGE_SIZE", 1000)
+# File browser upload validation (0 on max file size = unlimited).
+FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES = getattr(
+    settings, "FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES", 0
+)
+FILE_BROWSER_MAX_UPLOAD_FILES_PER_BATCH = getattr(
+    settings, "FILE_BROWSER_MAX_UPLOAD_FILES_PER_BATCH", 100
+)
+FILE_BROWSER_MAX_UPLOAD_QUEUE_ITEMS = getattr(
+    settings, "FILE_BROWSER_MAX_UPLOAD_QUEUE_ITEMS", 500
+)
+FILE_BROWSER_MAX_DELETE_PATHS = getattr(settings, "FILE_BROWSER_MAX_DELETE_PATHS", 100)
 
 
 class GoArch(models.TextChoices):

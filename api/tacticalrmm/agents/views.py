@@ -54,6 +54,7 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FILE_BROWSER_DEFAULT_PAGE_SIZE,
     FILE_BROWSER_MAX_PAGE_SIZE,
+    FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES,
     FileTransferOperation,
     FileTransferStatus,
     AgentHistoryType,
@@ -2034,6 +2035,15 @@ def init_file_upload(request, agent_id):
 
     if total_size < 1:
         return notify_error("total_size must be a positive integer")
+
+    if (
+        FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES > 0
+        and total_size > FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES
+    ):
+        max_mib = FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES // (1024 * 1024)
+        return notify_error(
+            f"File size exceeds the maximum allowed upload size ({max_mib} MiB)."
+        )
 
     full_destination_path = resolve_upload_destination_path(
         destination_path, filename, agent.plat

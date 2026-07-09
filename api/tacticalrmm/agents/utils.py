@@ -19,6 +19,7 @@ from tacticalrmm.constants import (
     AlertSeverity,
     CheckStatus,
     CheckType,
+    FILE_BROWSER_MAX_DELETE_PATHS,
     MeshAgentIdent,
 )
 from tacticalrmm.helpers import notify_error
@@ -412,9 +413,6 @@ def normalize_file_browser_items(raw_items) -> list:
 def normalize_file_browser_item(raw) -> Optional[dict]:
     items = normalize_file_browser_items([raw] if raw is not None else [])
     return items[0] if items else None
-
-
-FILE_BROWSER_MAX_DELETE_PATHS = 100
 
 
 def validate_file_browser_paths(paths, plat: str) -> Optional[str]:

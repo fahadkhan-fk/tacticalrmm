@@ -148,6 +148,32 @@ except NameError:
         TRMM_MAX_REQUEST_SIZE, FILE_TRANSFER_CHUNK_SIZE_MAX + 2**20
     )
 
+# cross-origin file transfers and content-range on chunk PUT/GET.
+from corsheaders.defaults import default_headers
+
+try:
+    _cors_allow_headers = CORS_ALLOW_HEADERS
+except NameError:
+    _cors_allow_headers = default_headers
+
+CORS_ALLOW_HEADERS = tuple(dict.fromkeys([*_cors_allow_headers, "content-range"]))
+
+try:
+    _cors_expose_headers = CORS_EXPOSE_HEADERS
+except NameError:
+    _cors_expose_headers = ()
+
+CORS_EXPOSE_HEADERS = tuple(
+    dict.fromkeys(
+        [
+            *_cors_expose_headers,
+            "content-range",
+            "x-chunk-start",
+            "x-chunk-end",
+        ]
+    )
+)
+
 if "GHACTIONS" in os.environ:
     print("-----------------------GHACTIONS----------------------------")
     DATABASES = {

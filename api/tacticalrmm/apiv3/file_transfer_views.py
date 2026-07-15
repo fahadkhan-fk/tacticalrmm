@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import logging
 import time
 
@@ -35,6 +36,14 @@ from tacticalrmm.constants import (
 from tacticalrmm.helpers import notify_error
 
 logger = logging.getLogger("trmm_file_transfer")
+
+_TERMINAL_STATUSES = (
+    FileTransferStatus.COMPLETED,
+    FileTransferStatus.FAILED,
+    FileTransferStatus.CANCELLED,
+    FileTransferStatus.EXPIRED,
+)
+_MAX_WARNINGS_CHARS = 8192
 
 
 class FileTransferNextChunk(APIView):
@@ -245,8 +254,8 @@ class FileTransferDownloadPutChunk(APIView):
 
         depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
         depth_wait_ms = 0.0
-        if start - committed > depth_bytes:
-            min_committed = start - depth_bytes
+        if start - committed >= depth_bytes:
+            min_committed = start - depth_bytes + session.chunk_size
             depth_wait_t0 = time.monotonic()
             new_committed = wait_for_download_ack(
                 session.session_id,
@@ -294,3 +303,90 @@ class FileTransferDownloadPutChunk(APIView):
                 "chunk_bytes": len(chunk_data),
             }
         )
+
+
+class FileTransferArchiveReady(APIView):
+    """Agent callback that completes an async archive (ZIP) prepare."""
+
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, session_id):
+        agent = getattr(request.user, "agent", None)
+        if agent is None:
+            return Response(
+                "Invalid agent credentials",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        session = get_object_or_404(
+            FileTransferSession,
+            session_id=session_id,
+            agent=agent,
+            operation=FileTransferOperation.DOWNLOAD,
+        )
+
+        if session.status in _TERMINAL_STATUSES:
+            return Response(
+                "Session is no longer active",
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        error = (request.data.get("error") or "").strip()
+        if error:
+            session.status = FileTransferStatus.FAILED
+            session.error_message = error[:2048]
+            session.save(update_fields=["status", "error_message", "updated_at"])
+            logger.info(
+                "file_transfer archive build failed session=%s: %s",
+                session.session_id,
+                session.error_message,
+            )
+            return Response({"status": "failed"})
+
+        if session.status in (
+            FileTransferStatus.AGENT_READY,
+            FileTransferStatus.TRANSFERRING,
+        ):
+            return Response({"status": "ready"})
+
+        try:
+            total_size = int(request.data.get("total_size"))
+        except (TypeError, ValueError):
+            return notify_error("total_size must be a positive integer")
+        if total_size < 1:
+            return notify_error("Agent reported empty or invalid archive")
+
+        archive_path = (request.data.get("archive_path") or "").strip()
+        if not archive_path:
+            return notify_error("archive_path is required")
+
+        warnings_value = ""
+        warnings = request.data.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            warnings_value = json.dumps([str(w) for w in warnings])[
+                :_MAX_WARNINGS_CHARS
+            ]
+
+        now = djangotime.now()
+        session.destination_path = archive_path
+        session.total_size = total_size
+        session.warnings = warnings_value
+        session.status = FileTransferStatus.AGENT_READY
+        session.expires_at = now + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS)
+        session.save(
+            update_fields=[
+                "destination_path",
+                "total_size",
+                "warnings",
+                "status",
+                "expires_at",
+                "updated_at",
+            ]
+        )
+        logger.info(
+            "file_transfer archive ready session=%s total_size=%s",
+            session.session_id,
+            total_size,
+        )
+        return Response({"status": "ready"})

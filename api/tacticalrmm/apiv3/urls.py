@@ -18,6 +18,11 @@ urlpatterns = [
         file_transfer_views.FileTransferDownloadPutChunk.as_view(),
         name="file_transfer_download_put_chunk",
     ),
+    path(
+        "file-transfers/<uuid:session_id>/archive-ready/",
+        file_transfer_views.FileTransferArchiveReady.as_view(),
+        name="file_transfer_archive_ready",
+    ),
     path("checkrunner/", views.CheckRunner.as_view()),
     path("<str:agentid>/checkrunner/", views.CheckRunner.as_view()),
     path("<str:agentid>/runchecks/", views.RunChecks.as_view()),

@@ -1356,6 +1356,8 @@ class FileTransferSession(models.Model):
     pending_chunk_created_at = models.DateTimeField(null=True, blank=True)
     last_ack_at = models.DateTimeField(null=True, blank=True)
     error_message = models.TextField(blank=True, default="")
+    is_archive = models.BooleanField(default=False)
+    warnings = models.TextField(blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     expires_at = models.DateTimeField()

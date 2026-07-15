@@ -300,6 +300,24 @@ def resolve_upload_destination_path(
     return f"{base}{sep}{filename}"
 
 
+def derive_archive_download_filename(
+    paths: list[str], requested: str | None = None
+) -> str:
+    name = (requested or "").strip()
+    if name:
+        if not name.lower().endswith(".zip"):
+            name = f"{name}.zip"
+        return name
+
+    if len(paths) == 1:
+        base = re.split(r"[\\/]+", paths[0].rstrip("\\/"))[-1] or "download"
+        if not base.lower().endswith(".zip"):
+            base = f"{base}.zip"
+        return base
+
+    return "download.zip"
+
+
 _UPLOAD_CONTENT_RANGE_RE = re.compile(
     r"^bytes (\d+)-(\d+)/(\d+|\*)$",
     re.IGNORECASE,

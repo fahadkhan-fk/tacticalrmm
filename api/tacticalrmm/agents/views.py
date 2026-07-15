@@ -55,6 +55,10 @@ from tacticalrmm.constants import (
     FILE_BROWSER_DEFAULT_PAGE_SIZE,
     FILE_BROWSER_MAX_PAGE_SIZE,
     FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES,
+    FILE_BROWSER_MAX_ARCHIVE_PATHS,
+    FILE_BROWSER_MAX_ARCHIVE_FILES,
+    FILE_BROWSER_MAX_ARCHIVE_SIZE_BYTES,
+    FILE_BROWSER_MAX_ARCHIVE_DEPTH,
     FileTransferOperation,
     FileTransferStatus,
     AgentHistoryType,
@@ -148,6 +152,7 @@ from .utils import (
     validate_file_browser_paths,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
+    derive_archive_download_filename,
 )
 
 logger = logging.getLogger("trmm_file_transfer")
@@ -2438,6 +2443,8 @@ def _resume_file_download(request, agent, session_id):
         "resume": "true",
         "committed_offset": str(resume_offset),
     }
+    if session.is_archive:
+        prepare_payload["remove_on_close"] = "true"
     response = send_nats_command(
         agent, "files_download_prepare", prepare_payload, timeout=30
     )
@@ -2584,6 +2591,133 @@ def init_file_download(request, agent_id):
             "chunk_size": chunk_size,
             "committed_offset": 0,
         }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def init_file_download_archive(request, agent_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    limit_err = enforce_file_transfer_session_limits(agent, request.user)
+    if limit_err is not None:
+        return limit_err
+
+    raw_paths = request.data.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        return notify_error("paths must be a non-empty array")
+
+    if len(raw_paths) > FILE_BROWSER_MAX_ARCHIVE_PATHS:
+        return notify_error(
+            f"Select at most {FILE_BROWSER_MAX_ARCHIVE_PATHS} paths for archive download"
+        )
+
+    validated_paths: list[str] = []
+    for raw_path in raw_paths:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        path_err = validate_file_transfer_destination_path(path, agent.plat)
+        if path_err:
+            return notify_error(f"Invalid path: {path_err}")
+        validated_paths.append(path)
+
+    if not validated_paths:
+        return notify_error("paths must contain at least one valid absolute path")
+
+    filename = derive_archive_download_filename(
+        validated_paths, request.data.get("filename")
+    )
+    filename_err = validate_file_transfer_filename(filename)
+    if filename_err:
+        return notify_error(filename_err)
+
+    raw_chunk_size = request.data.get("chunk_size")
+    if raw_chunk_size is not None:
+        try:
+            requested_chunk_size = int(raw_chunk_size)
+        except (TypeError, ValueError):
+            return notify_error("chunk_size must be a positive integer")
+        chunk_size = max(
+            FILE_TRANSFER_CHUNK_SIZE_MIN,
+            min(requested_chunk_size, FILE_TRANSFER_CHUNK_SIZE_MAX),
+        )
+    else:
+        chunk_size = FILE_TRANSFER_CHUNK_SIZE
+
+    session = FileTransferSession.objects.create(
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+        status=FileTransferStatus.WAITING_FOR_AGENT,
+        destination_path=validated_paths[0],
+        filename=filename,
+        total_size=0,
+        chunk_size=chunk_size,
+        committed_offset=0,
+        is_archive=True,
+        expires_at=djangotime.now()
+        + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
+    )
+
+    prepare_payload = {
+        "session_id": str(session.session_id),
+        "paths_json": json.dumps(validated_paths),
+        "chunk_size": str(chunk_size),
+        "max_files": str(FILE_BROWSER_MAX_ARCHIVE_FILES),
+        "max_size_bytes": str(FILE_BROWSER_MAX_ARCHIVE_SIZE_BYTES),
+        "max_depth": str(FILE_BROWSER_MAX_ARCHIVE_DEPTH),
+    }
+
+    logger.info(
+        "file_transfer archive download init session=%s agent=%s user=%s paths=%d filename=%s",
+        session.session_id,
+        agent.agent_id,
+        request.user.pk,
+        len(validated_paths),
+        filename,
+    )
+
+    response = send_nats_command(
+        agent,
+        "files_download_archive_prepare",
+        prepare_payload,
+        timeout=30,
+    )
+
+    if isinstance(response, Response):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(response.data)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return response
+
+    if not isinstance(response, dict):
+        session.status = FileTransferStatus.FAILED
+        session.error_message = "Invalid agent response"
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error("Invalid agent response")
+
+    if response.get("status") not in ("building", "ready"):
+        error_message = response.get("error") or "Agent failed to start archive build"
+        session.status = FileTransferStatus.FAILED
+        session.error_message = str(error_message)
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        return notify_error(str(error_message))
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "total_size": 0,
+            "chunk_size": chunk_size,
+            "committed_offset": 0,
+            "filename": filename,
+            "is_archive": True,
+            "preparing": True,
+        },
+        status=status.HTTP_202_ACCEPTED,
     )
 
 
@@ -2826,6 +2960,109 @@ def complete_file_download(request, agent_id, session_id):
             "source_path": session.destination_path,
             "committed_offset": committed_offset,
             "sha256": response.get("sha256", ""),
+        }
+    )
+
+
+def _release_download_session(
+    session: FileTransferSession, agent, error_message: str = "Download cancelled"
+) -> None:
+    clear_download_session_redis(session.session_id)
+    finalize_payload = {
+        "session_id": str(session.session_id),
+        "source_path": session.destination_path,
+    }
+    response = send_nats_command(
+        agent, "files_download_finalize", finalize_payload, timeout=30
+    )
+    if isinstance(response, dict) and response.get("error"):
+        logger.warning(
+            "file_transfer download release session=%s agent finalize: %s",
+            session.session_id,
+            response.get("error"),
+        )
+    session.status = FileTransferStatus.FAILED
+    session.error_message = error_message
+    session.save(update_fields=["status", "error_message", "updated_at"])
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def cancel_file_download(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+    )
+
+    if session.status in (
+        FileTransferStatus.COMPLETED,
+        FileTransferStatus.FAILED,
+        FileTransferStatus.EXPIRED,
+    ):
+        return Response(
+            {"session_id": str(session.session_id), "status": session.status}
+        )
+
+    _release_download_session(session, agent)
+    logger.info(
+        "file_transfer download cancelled session=%s agent=%s user=%s",
+        session.session_id,
+        agent.agent_id,
+        request.user.pk,
+    )
+    return Response({"session_id": str(session.session_id), "status": session.status})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def get_file_download_status(request, agent_id, session_id):
+    """Lightweight status poll for a download session."""
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.DOWNLOAD,
+    )
+
+    if (
+        session.status in _FILE_TRANSFER_ACTIVE_STATUSES
+        and session.expires_at <= djangotime.now()
+    ):
+        session.status = FileTransferStatus.EXPIRED
+        session.save(update_fields=["status", "updated_at"])
+
+    warnings: list = []
+    if session.warnings:
+        try:
+            parsed = json.loads(session.warnings)
+            if isinstance(parsed, list):
+                warnings = parsed
+        except (ValueError, TypeError):
+            warnings = []
+
+    return Response(
+        {
+            "session_id": str(session.session_id),
+            "status": session.status,
+            "total_size": session.total_size,
+            "chunk_size": session.chunk_size,
+            "committed_offset": session.committed_offset,
+            "filename": session.filename,
+            "is_archive": session.is_archive,
+            "warnings": warnings,
+            "error": session.error_message,
         }
     )
 

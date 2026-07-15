@@ -124,6 +124,11 @@ urlpatterns = [
         name="init_file_download",
     ),
     path(
+        "<agent:agent_id>/files/download/archive/init/",
+        views.init_file_download_archive,
+        name="init_file_download_archive",
+    ),
+    path(
         "<agent:agent_id>/files/download/<uuid:session_id>/chunk/",
         views.get_file_download_chunk,
         name="get_file_download_chunk",
@@ -137,5 +142,15 @@ urlpatterns = [
         "<agent:agent_id>/files/download/<uuid:session_id>/complete/",
         views.complete_file_download,
         name="complete_file_download",
+    ),
+    path(
+        "<agent:agent_id>/files/download/<uuid:session_id>/cancel/",
+        views.cancel_file_download,
+        name="cancel_file_download",
+    ),
+    path(
+        "<agent:agent_id>/files/download/<uuid:session_id>/status/",
+        views.get_file_download_status,
+        name="get_file_download_status",
     ),
 ]

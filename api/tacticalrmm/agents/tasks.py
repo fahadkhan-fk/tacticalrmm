@@ -263,6 +263,8 @@ def prune_agent_history(older_than_days: int) -> str:
 
 @app.task
 def cleanup_expired_file_transfers_task() -> str:
+    from agents.utils import send_nats_command
+
     from .file_transfer_relay import (
         clear_download_session_redis,
         clear_upload_session_redis,
@@ -275,6 +277,31 @@ def cleanup_expired_file_transfers_task() -> str:
         else:
             clear_download_session_redis(session.session_id)
 
+    def _notify_agent_release(session: "FileTransferSession") -> None:
+        agent = session.agent
+        if agent is None or agent.status != "online":
+            return
+        try:
+            if session.operation == FileTransferOperation.UPLOAD:
+                send_nats_command(
+                    agent,
+                    "files_upload_abort",
+                    {"session_id": str(session.session_id)},
+                    timeout=5,
+                )
+            else:
+                send_nats_command(
+                    agent,
+                    "files_download_finalize",
+                    {
+                        "session_id": str(session.session_id),
+                        "source_path": session.destination_path,
+                    },
+                    timeout=5,
+                )
+        except Exception:
+            pass
+
     now = djangotime.now()
 
     expired_count = 0
@@ -286,9 +313,10 @@ def cleanup_expired_file_transfers_task() -> str:
             FileTransferStatus.TRANSFERRING,
         ),
         expires_at__lte=now,
-    )
+    ).select_related("agent")
     for session in active_sessions.iterator():
         _clear_redis(session)
+        _notify_agent_release(session)
         session.status = FileTransferStatus.EXPIRED
         session.error_message = session.error_message or "Session expired"
         session.save(update_fields=["status", "error_message", "updated_at"])

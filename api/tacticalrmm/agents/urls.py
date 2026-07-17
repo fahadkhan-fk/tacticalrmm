@@ -119,6 +119,11 @@ urlpatterns = [
         name="complete_file_upload",
     ),
     path(
+        "<agent:agent_id>/files/upload/<uuid:session_id>/cancel/",
+        views.cancel_file_upload,
+        name="cancel_file_upload",
+    ),
+    path(
         "<agent:agent_id>/files/download/init/",
         views.init_file_download,
         name="init_file_download",

@@ -9,6 +9,7 @@ from io import StringIO
 from pathlib import Path
 
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -59,6 +60,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_MAX_ARCHIVE_FILES,
     FILE_BROWSER_MAX_ARCHIVE_SIZE_BYTES,
     FILE_BROWSER_MAX_ARCHIVE_DEPTH,
+    FILE_BROWSER_ARCHIVE_BUILD_TTL_MINUTES,
     FileTransferOperation,
     FileTransferStatus,
     AgentHistoryType,
@@ -1712,6 +1714,17 @@ def enforce_file_transfer_session_limits(agent, user):
     return None
 
 
+def create_file_transfer_session_locked(agent, user, **fields):
+    """Atomically enforce concurrency caps and create the session."""
+    with transaction.atomic():
+        # Lock the agent row so concurrent inits for this agent serialize here.
+        Agent.objects.select_for_update().filter(pk=agent.pk).first()
+        limit_err = enforce_file_transfer_session_limits(agent, user)
+        if limit_err is not None:
+            return limit_err
+        return FileTransferSession.objects.create(agent=agent, user=user, **fields)
+
+
 _FILE_TRANSFER_RESUMABLE_STATUSES = (
     FileTransferStatus.WAITING_FOR_AGENT,
     FileTransferStatus.AGENT_READY,
@@ -2018,10 +2031,6 @@ def init_file_upload(request, agent_id):
     if resume_session_id:
         return _resume_file_upload(request, agent, resume_session_id)
 
-    limit_err = enforce_file_transfer_session_limits(agent, request.user)
-    if limit_err is not None:
-        return limit_err
-
     filename = (request.data.get("filename") or "").strip()
     destination_path = (request.data.get("destination_path") or "").strip()
 
@@ -2072,9 +2081,9 @@ def init_file_upload(request, agent_id):
     else:
         chunk_size = FILE_TRANSFER_CHUNK_SIZE
 
-    session = FileTransferSession.objects.create(
-        agent=agent,
-        user=request.user,
+    session = create_file_transfer_session_locked(
+        agent,
+        request.user,
         operation=FileTransferOperation.UPLOAD,
         status=FileTransferStatus.WAITING_FOR_AGENT,
         destination_path=full_destination_path,
@@ -2085,6 +2094,8 @@ def init_file_upload(request, agent_id):
         expires_at=djangotime.now()
         + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
     )
+    if isinstance(session, Response):
+        return session
 
     prepare_payload = {
         "session_id": str(session.session_id),
@@ -2508,10 +2519,6 @@ def init_file_download(request, agent_id):
     if resume_session_id:
         return _resume_file_download(request, agent, resume_session_id)
 
-    limit_err = enforce_file_transfer_session_limits(agent, request.user)
-    if limit_err is not None:
-        return limit_err
-
     source_path = (request.data.get("source_path") or "").strip()
     path_err = validate_file_transfer_destination_path(source_path, agent.plat)
     if path_err:
@@ -2530,9 +2537,9 @@ def init_file_download(request, agent_id):
     else:
         chunk_size = FILE_TRANSFER_CHUNK_SIZE
 
-    session = FileTransferSession.objects.create(
-        agent=agent,
-        user=request.user,
+    session = create_file_transfer_session_locked(
+        agent,
+        request.user,
         operation=FileTransferOperation.DOWNLOAD,
         status=FileTransferStatus.WAITING_FOR_AGENT,
         destination_path=source_path,
@@ -2543,6 +2550,8 @@ def init_file_download(request, agent_id):
         expires_at=djangotime.now()
         + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
     )
+    if isinstance(session, Response):
+        return session
 
     prepare_payload = {
         "session_id": str(session.session_id),
@@ -2608,10 +2617,6 @@ def init_file_download_archive(request, agent_id):
     if isinstance(agent, Response):
         return agent
 
-    limit_err = enforce_file_transfer_session_limits(agent, request.user)
-    if limit_err is not None:
-        return limit_err
-
     raw_paths = request.data.get("paths")
     if not isinstance(raw_paths, list) or not raw_paths:
         return notify_error("paths must be a non-empty array")
@@ -2654,9 +2659,9 @@ def init_file_download_archive(request, agent_id):
     else:
         chunk_size = FILE_TRANSFER_CHUNK_SIZE
 
-    session = FileTransferSession.objects.create(
-        agent=agent,
-        user=request.user,
+    session = create_file_transfer_session_locked(
+        agent,
+        request.user,
         operation=FileTransferOperation.DOWNLOAD,
         status=FileTransferStatus.WAITING_FOR_AGENT,
         destination_path=validated_paths[0],
@@ -2666,8 +2671,10 @@ def init_file_download_archive(request, agent_id):
         committed_offset=0,
         is_archive=True,
         expires_at=djangotime.now()
-        + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS),
+        + dt.timedelta(minutes=FILE_BROWSER_ARCHIVE_BUILD_TTL_MINUTES),
     )
+    if isinstance(session, Response):
+        return session
 
     prepare_payload = {
         "session_id": str(session.session_id),
@@ -2972,7 +2979,10 @@ def complete_file_download(request, agent_id, session_id):
 
 
 def _release_download_session(
-    session: FileTransferSession, agent, error_message: str = "Download cancelled"
+    session: FileTransferSession,
+    agent,
+    error_message: str = "Download cancelled",
+    new_status: str = FileTransferStatus.FAILED,
 ) -> None:
     clear_download_session_redis(session.session_id)
     finalize_payload = {
@@ -2988,7 +2998,27 @@ def _release_download_session(
             session.session_id,
             response.get("error"),
         )
-    session.status = FileTransferStatus.FAILED
+    session.status = new_status
+    session.error_message = error_message
+    session.save(update_fields=["status", "error_message", "updated_at"])
+
+
+def _release_upload_session(
+    session: FileTransferSession,
+    agent,
+    error_message: str = "Upload cancelled",
+    new_status: str = FileTransferStatus.FAILED,
+) -> None:
+    clear_upload_session_redis(session.session_id)
+    abort_payload = {"session_id": str(session.session_id)}
+    response = send_nats_command(agent, "files_upload_abort", abort_payload, timeout=30)
+    if isinstance(response, dict) and response.get("error"):
+        logger.warning(
+            "file_transfer upload release session=%s agent abort: %s",
+            session.session_id,
+            response.get("error"),
+        )
+    session.status = new_status
     session.error_message = error_message
     session.save(update_fields=["status", "error_message", "updated_at"])
 
@@ -3011,15 +3041,61 @@ def cancel_file_download(request, agent_id, session_id):
     if session.status in (
         FileTransferStatus.COMPLETED,
         FileTransferStatus.FAILED,
+        FileTransferStatus.CANCELLED,
         FileTransferStatus.EXPIRED,
     ):
         return Response(
             {"session_id": str(session.session_id), "status": session.status}
         )
 
-    _release_download_session(session, agent)
+    _release_download_session(
+        session,
+        agent,
+        error_message="Download cancelled by user",
+        new_status=FileTransferStatus.CANCELLED,
+    )
     logger.info(
         "file_transfer download cancelled session=%s agent=%s user=%s",
+        session.session_id,
+        agent.agent_id,
+        request.user.pk,
+    )
+    return Response({"session_id": str(session.session_id), "status": session.status})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def cancel_file_upload(request, agent_id, session_id):
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    session = get_object_or_404(
+        FileTransferSession,
+        session_id=session_id,
+        agent=agent,
+        user=request.user,
+        operation=FileTransferOperation.UPLOAD,
+    )
+
+    if session.status in (
+        FileTransferStatus.COMPLETED,
+        FileTransferStatus.FAILED,
+        FileTransferStatus.CANCELLED,
+        FileTransferStatus.EXPIRED,
+    ):
+        return Response(
+            {"session_id": str(session.session_id), "status": session.status}
+        )
+
+    _release_upload_session(
+        session,
+        agent,
+        error_message="Upload cancelled by user",
+        new_status=FileTransferStatus.CANCELLED,
+    )
+    logger.info(
+        "file_transfer upload cancelled session=%s agent=%s user=%s",
         session.session_id,
         agent.agent_id,
         request.user.pk,

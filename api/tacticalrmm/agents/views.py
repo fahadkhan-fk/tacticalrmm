@@ -2426,6 +2426,12 @@ def _resume_file_download(request, agent, session_id):
             f"Download session cannot be resumed (status: {session.status})"
         )
 
+    if session.is_archive and session.status not in (
+        FileTransferStatus.AGENT_READY,
+        FileTransferStatus.TRANSFERRING,
+    ):
+        return notify_error("Archive is still being prepared; cannot resume yet")
+
     try:
         resume_offset = int(request.data.get("resume_offset", session.committed_offset))
     except (TypeError, ValueError):
@@ -2445,6 +2451,9 @@ def _resume_file_download(request, agent, session_id):
     }
     if session.is_archive:
         prepare_payload["remove_on_close"] = "true"
+
+    clear_download_session_redis(session.session_id)
+
     response = send_nats_command(
         agent, "files_download_prepare", prepare_payload, timeout=30
     )
@@ -2466,8 +2475,6 @@ def _resume_file_download(request, agent, session_id):
         return notify_error(
             "Source file changed since the transfer started; cannot resume"
         )
-
-    clear_download_session_redis(session.session_id)
 
     session.status = FileTransferStatus.AGENT_READY
     session.committed_offset = resume_offset

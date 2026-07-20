@@ -3048,14 +3048,23 @@ def cancel_file_download(request, agent_id, session_id):
             {"session_id": str(session.session_id), "status": session.status}
         )
 
+    reason = (request.data.get("reason") or "user").strip().lower()
+    if reason == "error":
+        new_status = FileTransferStatus.FAILED
+        error_message = "Download released after failure"
+    else:
+        new_status = FileTransferStatus.CANCELLED
+        error_message = "Download cancelled by user"
+
     _release_download_session(
         session,
         agent,
-        error_message="Download cancelled by user",
-        new_status=FileTransferStatus.CANCELLED,
+        error_message=error_message,
+        new_status=new_status,
     )
     logger.info(
-        "file_transfer download cancelled session=%s agent=%s user=%s",
+        "file_transfer download %s session=%s agent=%s user=%s",
+        "released" if reason == "error" else "cancelled",
         session.session_id,
         agent.agent_id,
         request.user.pk,
@@ -3088,14 +3097,23 @@ def cancel_file_upload(request, agent_id, session_id):
             {"session_id": str(session.session_id), "status": session.status}
         )
 
+    reason = (request.data.get("reason") or "user").strip().lower()
+    if reason == "error":
+        new_status = FileTransferStatus.FAILED
+        error_message = "Upload released after failure"
+    else:
+        new_status = FileTransferStatus.CANCELLED
+        error_message = "Upload cancelled by user"
+
     _release_upload_session(
         session,
         agent,
-        error_message="Upload cancelled by user",
-        new_status=FileTransferStatus.CANCELLED,
+        error_message=error_message,
+        new_status=new_status,
     )
     logger.info(
-        "file_transfer upload cancelled session=%s agent=%s user=%s",
+        "file_transfer upload %s session=%s agent=%s user=%s",
+        "released" if reason == "error" else "cancelled",
         session.session_id,
         agent.agent_id,
         request.user.pk,

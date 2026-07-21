@@ -1947,7 +1947,11 @@ def create_file_folder(request, agent_id):
     path = normalize_file_browser_path(path, agent.plat)
 
     response = send_nats_command(
-        agent, "files_mkdir", {"path": path, "name": name}, timeout=30
+        agent,
+        "files_mkdir",
+        {"path": path, "name": name},
+        timeout=30,
+        prefix_error=False,
     )
     if isinstance(response, Response):
         return response
@@ -1990,6 +1994,7 @@ def rename_file(request, agent_id):
         "files_rename",
         {"path": path, "new_name": new_name},
         timeout=30,
+        prefix_error=False,
     )
     if isinstance(response, Response):
         return response

@@ -141,7 +141,9 @@ def send_nats_notification(agent, func: str, payload: dict) -> Optional[Response
     return None
 
 
-def send_nats_command(agent, func: str, payload: dict, timeout: int = 60):
+def send_nats_command(
+    agent, func: str, payload: dict, timeout: int = 60, *, prefix_error: bool = True
+):
     try:
         data = {"func": func, "payload": payload}
         response = asyncio.run(agent.nats_cmd(data, timeout=timeout))
@@ -152,9 +154,10 @@ def send_nats_command(agent, func: str, payload: dict, timeout: int = 60):
         return notify_error("Unable to contact the agent")
 
     if isinstance(response, dict) and "error" in response:
-        return notify_error(
-            f"{func.replace('_', ' ').title()} failed: {response['error']}"
-        )
+        err = str(response["error"])
+        if prefix_error:
+            return notify_error(f"{func.replace('_', ' ').title()} failed: {err}")
+        return notify_error(err)
 
     return response
 

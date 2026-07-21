@@ -61,6 +61,9 @@ from tacticalrmm.constants import (
     FILE_BROWSER_MAX_ARCHIVE_SIZE_BYTES,
     FILE_BROWSER_MAX_ARCHIVE_DEPTH,
     FILE_BROWSER_ARCHIVE_BUILD_TTL_MINUTES,
+    FILE_BROWSER_PROPERTIES_MAX_FILES,
+    FILE_BROWSER_PROPERTIES_MAX_DEPTH,
+    FILE_BROWSER_PROPERTIES_MAX_DURATION_SECONDS,
     FileTransferOperation,
     FileTransferStatus,
     AgentHistoryType,
@@ -144,6 +147,7 @@ from .utils import (
     normalize_file_browser_delete_results,
     normalize_file_browser_item,
     normalize_file_browser_items,
+    normalize_file_browser_properties,
     normalize_file_browser_path,
     parse_upload_content_range,
     resolve_upload_destination_path,
@@ -1895,14 +1899,24 @@ def get_file_properties(request, agent_id):
     if path_err:
         return notify_error(path_err)
 
-    response = send_nats_command(agent, "files_properties", {"path": path}, timeout=30)
+    response = send_nats_command(
+        agent,
+        "files_properties",
+        {
+            "path": path,
+            "max_files": str(FILE_BROWSER_PROPERTIES_MAX_FILES),
+            "max_depth": str(FILE_BROWSER_PROPERTIES_MAX_DEPTH),
+            "max_duration_seconds": str(FILE_BROWSER_PROPERTIES_MAX_DURATION_SECONDS),
+        },
+        timeout=45,
+    )
     if isinstance(response, Response):
         return response
 
     if not isinstance(response, dict):
         return notify_error("Invalid agent response")
 
-    item = normalize_file_browser_item(response)
+    item = normalize_file_browser_properties(response)
     if not item:
         return notify_error("Invalid agent response")
 

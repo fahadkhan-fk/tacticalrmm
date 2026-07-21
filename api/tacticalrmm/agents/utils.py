@@ -433,6 +433,30 @@ def normalize_file_browser_item(raw) -> Optional[dict]:
     return items[0] if items else None
 
 
+def normalize_file_browser_properties(raw) -> Optional[dict]:
+    """Normalize a files_properties agent response, including folder summary fields."""
+    item = normalize_file_browser_item(raw)
+    if not item or not isinstance(raw, dict):
+        return item
+
+    location = (raw.get("location") or "").strip()
+    if location:
+        item["location"] = location
+
+    if item["type"] == "folder":
+        try:
+            item["file_count"] = max(0, int(raw.get("file_count", 0)))
+        except (TypeError, ValueError):
+            item["file_count"] = 0
+        try:
+            item["folder_count"] = max(0, int(raw.get("folder_count", 0)))
+        except (TypeError, ValueError):
+            item["folder_count"] = 0
+        item["summary_truncated"] = bool(raw.get("summary_truncated", False))
+
+    return item
+
+
 def validate_file_browser_paths(paths, plat: str) -> Optional[str]:
     if not isinstance(paths, list) or not paths:
         return "paths is required"

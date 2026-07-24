@@ -693,6 +693,11 @@ class FileTransferOperation(models.TextChoices):
     DOWNLOAD = "download", "Download"
 
 
+class FileTransferConflictPolicy(models.TextChoices):
+    REPLACE = "replace", "Replace"
+    SKIP = "skip", "Skip"
+
+
 class FileTransferStatus(models.TextChoices):
     INITIALIZING = "initializing", "Initializing"
     WAITING_FOR_AGENT = "waiting_for_agent", "Waiting for agent"

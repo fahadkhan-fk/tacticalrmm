@@ -45,6 +45,7 @@ from tacticalrmm.constants import (
     CustomFieldType,
     DebugLogType,
     FileTransferOperation,
+    FileTransferConflictPolicy,
     FileTransferStatus,
     GoArch,
     PAAction,
@@ -1348,6 +1349,11 @@ class FileTransferSession(models.Model):
     )
     destination_path = models.CharField(max_length=4096)
     filename = models.CharField(max_length=255)
+    conflict_policy = models.CharField(
+        max_length=16,
+        choices=FileTransferConflictPolicy.choices,
+        default=FileTransferConflictPolicy.REPLACE,
+    )
     total_size = models.BigIntegerField()
     chunk_size = models.PositiveIntegerField()
     committed_offset = models.BigIntegerField(default=0)

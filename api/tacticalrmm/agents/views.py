@@ -64,6 +64,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_PROPERTIES_MAX_FILES,
     FILE_BROWSER_PROPERTIES_MAX_DEPTH,
     FILE_BROWSER_PROPERTIES_MAX_DURATION_SECONDS,
+    FileTransferConflictPolicy,
     FileTransferOperation,
     FileTransferStatus,
     AgentHistoryType,
@@ -1729,6 +1730,16 @@ def create_file_transfer_session_locked(agent, user, **fields):
         return FileTransferSession.objects.create(agent=agent, user=user, **fields)
 
 
+def _normalize_upload_conflict_policy(raw):
+    """Return a valid conflict policy, or None when an invalid value."""
+    val = (raw or "").strip().lower()
+    if not val:
+        return FileTransferConflictPolicy.REPLACE
+    if val in FileTransferConflictPolicy.values:
+        return val
+    return None
+
+
 _FILE_TRANSFER_RESUMABLE_STATUSES = (
     FileTransferStatus.WAITING_FOR_AGENT,
     FileTransferStatus.AGENT_READY,
@@ -1777,6 +1788,8 @@ def _resume_file_upload(request, agent, session_id):
         "filename": session.filename,
         "total_size": str(session.total_size),
         "chunk_size": str(session.chunk_size),
+        "conflict_policy": session.conflict_policy
+        or FileTransferConflictPolicy.REPLACE,
         "resume": "true",
         "committed_offset": str(resume_offset),
     }
@@ -2100,6 +2113,12 @@ def init_file_upload(request, agent_id):
     else:
         chunk_size = FILE_TRANSFER_CHUNK_SIZE
 
+    conflict_policy = _normalize_upload_conflict_policy(
+        request.data.get("conflict_policy")
+    )
+    if conflict_policy is None:
+        return notify_error("conflict_policy must be 'replace' or 'skip'")
+
     session = create_file_transfer_session_locked(
         agent,
         request.user,
@@ -2107,6 +2126,7 @@ def init_file_upload(request, agent_id):
         status=FileTransferStatus.WAITING_FOR_AGENT,
         destination_path=full_destination_path,
         filename=filename,
+        conflict_policy=conflict_policy,
         total_size=total_size,
         chunk_size=chunk_size,
         committed_offset=0,
@@ -2122,6 +2142,7 @@ def init_file_upload(request, agent_id):
         "filename": session.filename,
         "total_size": str(session.total_size),
         "chunk_size": str(session.chunk_size),
+        "conflict_policy": session.conflict_policy,
     }
     response = send_nats_command(
         agent, "files_upload_prepare", prepare_payload, timeout=30
@@ -2394,6 +2415,8 @@ def complete_file_upload(request, agent_id, session_id):
         "session_id": str(session.session_id),
         "destination_path": session.destination_path,
         "total_size": str(session.total_size),
+        "conflict_policy": session.conflict_policy
+        or FileTransferConflictPolicy.REPLACE,
     }
 
     client_sha256 = (request.data.get("sha256") or "").strip().lower()

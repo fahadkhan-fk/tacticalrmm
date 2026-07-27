@@ -1683,7 +1683,6 @@ def modify_registry_value(request, agent_id):
 
 
 _FILE_TRANSFER_ACTIVE_STATUSES = (
-    FileTransferStatus.INITIALIZING,
     FileTransferStatus.WAITING_FOR_AGENT,
     FileTransferStatus.AGENT_READY,
     FileTransferStatus.TRANSFERRING,
@@ -2396,16 +2395,10 @@ def complete_file_upload(request, agent_id, session_id):
 
     if session.committed_offset != committed_offset:
         session.committed_offset = committed_offset
-        session.pending_chunk_start = None
-        session.pending_chunk_end = None
-        session.pending_chunk_created_at = None
         session.last_ack_at = djangotime.now()
         session.save(
             update_fields=[
                 "committed_offset",
-                "pending_chunk_start",
-                "pending_chunk_end",
-                "pending_chunk_created_at",
                 "last_ack_at",
                 "updated_at",
             ]
@@ -2755,7 +2748,7 @@ def init_file_download_archive(request, agent_id):
         session.save(update_fields=["status", "error_message", "updated_at"])
         return notify_error("Invalid agent response")
 
-    if response.get("status") not in ("building", "ready"):
+    if response.get("status") != "building":
         error_message = response.get("error") or "Agent failed to start archive build"
         session.status = FileTransferStatus.FAILED
         session.error_message = str(error_message)
@@ -2896,17 +2889,11 @@ def ack_file_download_chunk(request, agent_id, session_id):
         now = djangotime.now()
         update_fields = [
             "committed_offset",
-            "pending_chunk_start",
-            "pending_chunk_end",
-            "pending_chunk_created_at",
             "last_ack_at",
             "expires_at",
             "updated_at",
         ]
         session.committed_offset = committed_offset
-        session.pending_chunk_start = None
-        session.pending_chunk_end = None
-        session.pending_chunk_created_at = None
         session.last_ack_at = now
         session.expires_at = now + dt.timedelta(hours=FILE_TRANSFER_SESSION_TTL_HOURS)
         if session.status == FileTransferStatus.AGENT_READY:
@@ -2963,16 +2950,10 @@ def complete_file_download(request, agent_id, session_id):
 
     if session.committed_offset != committed_offset:
         session.committed_offset = committed_offset
-        session.pending_chunk_start = None
-        session.pending_chunk_end = None
-        session.pending_chunk_created_at = None
         session.last_ack_at = djangotime.now()
         session.save(
             update_fields=[
                 "committed_offset",
-                "pending_chunk_start",
-                "pending_chunk_end",
-                "pending_chunk_created_at",
                 "last_ack_at",
                 "updated_at",
             ]

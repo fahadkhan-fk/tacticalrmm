@@ -84,12 +84,6 @@ FILE_BROWSER_MAX_PAGE_SIZE = getattr(settings, "FILE_BROWSER_MAX_PAGE_SIZE", 100
 FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES = getattr(
     settings, "FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES", 0
 )
-FILE_BROWSER_MAX_UPLOAD_FILES_PER_BATCH = getattr(
-    settings, "FILE_BROWSER_MAX_UPLOAD_FILES_PER_BATCH", 100
-)
-FILE_BROWSER_MAX_UPLOAD_QUEUE_ITEMS = getattr(
-    settings, "FILE_BROWSER_MAX_UPLOAD_QUEUE_ITEMS", 500
-)
 FILE_BROWSER_MAX_DELETE_PATHS = getattr(settings, "FILE_BROWSER_MAX_DELETE_PATHS", 100)
 FILE_BROWSER_MAX_ARCHIVE_PATHS = getattr(
     settings, "FILE_BROWSER_MAX_ARCHIVE_PATHS", 100
@@ -101,9 +95,6 @@ FILE_BROWSER_MAX_ARCHIVE_SIZE_BYTES = getattr(
     settings, "FILE_BROWSER_MAX_ARCHIVE_SIZE_BYTES", 4 * 1024 * 1024 * 1024
 )
 FILE_BROWSER_MAX_ARCHIVE_DEPTH = getattr(settings, "FILE_BROWSER_MAX_ARCHIVE_DEPTH", 32)
-FILE_BROWSER_ARCHIVE_PREPARE_TIMEOUT = getattr(
-    settings, "FILE_BROWSER_ARCHIVE_PREPARE_TIMEOUT", 3600
-)
 FILE_BROWSER_ARCHIVE_BUILD_TTL_MINUTES = getattr(
     settings, "FILE_BROWSER_ARCHIVE_BUILD_TTL_MINUTES", 60
 )
@@ -699,7 +690,6 @@ class FileTransferConflictPolicy(models.TextChoices):
 
 
 class FileTransferStatus(models.TextChoices):
-    INITIALIZING = "initializing", "Initializing"
     WAITING_FOR_AGENT = "waiting_for_agent", "Waiting for agent"
     AGENT_READY = "agent_ready", "Agent ready"
     TRANSFERRING = "transferring", "Transferring"

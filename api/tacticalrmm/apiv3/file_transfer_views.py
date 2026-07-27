@@ -156,17 +156,11 @@ class FileTransferAck(APIView):
             now = djangotime.now()
             update_fields = [
                 "committed_offset",
-                "pending_chunk_start",
-                "pending_chunk_end",
-                "pending_chunk_created_at",
                 "last_ack_at",
                 "expires_at",
                 "updated_at",
             ]
             session.committed_offset = committed_offset
-            session.pending_chunk_start = None
-            session.pending_chunk_end = None
-            session.pending_chunk_created_at = None
             session.last_ack_at = now
             session.expires_at = now + dt.timedelta(
                 hours=FILE_TRANSFER_SESSION_TTL_HOURS

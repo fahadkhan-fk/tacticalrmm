@@ -1345,7 +1345,7 @@ class FileTransferSession(models.Model):
     status = models.CharField(
         max_length=32,
         choices=FileTransferStatus.choices,
-        default=FileTransferStatus.INITIALIZING,
+        default=FileTransferStatus.WAITING_FOR_AGENT,
     )
     destination_path = models.CharField(max_length=4096)
     filename = models.CharField(max_length=255)
@@ -1357,9 +1357,6 @@ class FileTransferSession(models.Model):
     total_size = models.BigIntegerField()
     chunk_size = models.PositiveIntegerField()
     committed_offset = models.BigIntegerField(default=0)
-    pending_chunk_start = models.BigIntegerField(null=True, blank=True)
-    pending_chunk_end = models.BigIntegerField(null=True, blank=True)
-    pending_chunk_created_at = models.DateTimeField(null=True, blank=True)
     last_ack_at = models.DateTimeField(null=True, blank=True)
     error_message = models.TextField(blank=True, default="")
     is_archive = models.BooleanField(default=False)

@@ -307,7 +307,6 @@ def cleanup_expired_file_transfers_task() -> str:
     expired_count = 0
     active_sessions = FileTransferSession.objects.filter(
         status__in=(
-            FileTransferStatus.INITIALIZING,
             FileTransferStatus.WAITING_FOR_AGENT,
             FileTransferStatus.AGENT_READY,
             FileTransferStatus.TRANSFERRING,

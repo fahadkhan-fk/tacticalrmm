@@ -157,6 +157,7 @@ from .utils import (
     validate_file_browser_name,
     validate_file_browser_path,
     validate_file_browser_paths,
+    sanitize_file_browser_name_filter,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
     derive_archive_download_filename,
@@ -1866,11 +1867,19 @@ def list_files(request, agent_id):
             f"page_size must be between 1 and {FILE_BROWSER_MAX_PAGE_SIZE}"
         )
 
+    name_filter, filter_err = sanitize_file_browser_name_filter(
+        request.query_params.get("filter")
+    )
+    if filter_err:
+        return notify_error(filter_err)
+
     payload = {
         "path": path,
         "page": str(page),
         "page_size": str(page_size),
     }
+    if name_filter:
+        payload["filter"] = name_filter
     response = send_nats_command(agent, "files_list", payload, timeout=30)
     if isinstance(response, Response):
         return response

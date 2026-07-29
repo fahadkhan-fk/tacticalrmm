@@ -4,7 +4,7 @@ import threading
 import urllib.parse
 from io import StringIO
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from django.conf import settings
 from django.http import FileResponse
@@ -20,6 +20,7 @@ from tacticalrmm.constants import (
     CheckStatus,
     CheckType,
     FILE_BROWSER_MAX_DELETE_PATHS,
+    FILE_BROWSER_MAX_NAME_FILTER_LEN,
     MeshAgentIdent,
 )
 from tacticalrmm.helpers import notify_error
@@ -373,6 +374,25 @@ def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
     if not value.startswith("/"):
         return "path must be an absolute path"
     return None
+
+
+def sanitize_file_browser_name_filter(raw) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Light sanitization for files_list name substring filter.
+    """
+    if raw is None:
+        return None, None
+    value = str(raw).strip()
+    if not value:
+        return None, None
+    if any(ch in value for ch in ("\n", "\r", "\x00")):
+        return None, "filter contains invalid characters"
+    if len(value) > FILE_BROWSER_MAX_NAME_FILTER_LEN:
+        return (
+            None,
+            f"filter must be at most {FILE_BROWSER_MAX_NAME_FILTER_LEN} characters",
+        )
+    return value, None
 
 
 def normalize_file_browser_path(path: str, plat: str) -> str:

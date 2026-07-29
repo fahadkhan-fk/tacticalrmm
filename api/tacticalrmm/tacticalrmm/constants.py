@@ -80,6 +80,9 @@ FILE_BROWSER_DEFAULT_PAGE_SIZE = getattr(
     settings, "FILE_BROWSER_DEFAULT_PAGE_SIZE", 500
 )
 FILE_BROWSER_MAX_PAGE_SIZE = getattr(settings, "FILE_BROWSER_MAX_PAGE_SIZE", 1000)
+FILE_BROWSER_MAX_NAME_FILTER_LEN = getattr(
+    settings, "FILE_BROWSER_MAX_NAME_FILTER_LEN", 255
+)
 # File browser upload validation (0 on max file size = unlimited).
 FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES = getattr(
     settings, "FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES", 0

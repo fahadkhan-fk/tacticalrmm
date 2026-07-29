@@ -1845,12 +1845,6 @@ def list_files(request, agent_id):
         return agent
 
     path = (request.query_params.get("path") or "").strip()
-    if not path:
-        return notify_error("path is required")
-
-    path_err = validate_file_browser_path(path, agent.plat)
-    if path_err:
-        return notify_error(path_err)
 
     try:
         page = int(request.query_params.get("page", 1))
@@ -1866,6 +1860,13 @@ def list_files(request, agent_id):
         return notify_error(
             f"page_size must be between 1 and {FILE_BROWSER_MAX_PAGE_SIZE}"
         )
+
+    if path:
+        path_err = validate_file_browser_path(path, agent.plat)
+        if path_err:
+            return notify_error(path_err)
+    elif page != 1:
+        return notify_error("path is required")
 
     name_filter, filter_err = sanitize_file_browser_name_filter(
         request.query_params.get("filter")
@@ -1887,6 +1888,10 @@ def list_files(request, agent_id):
     if not isinstance(response, dict):
         return notify_error("Invalid agent response")
 
+    resolved_path = (response.get("path") or path or "").strip()
+    if not resolved_path:
+        return notify_error("Agent did not return a browsable path")
+
     items = normalize_file_browser_items(response.get("items", []))
     try:
         total = int(response.get("total", len(items)))
@@ -1895,7 +1900,7 @@ def list_files(request, agent_id):
 
     return Response(
         {
-            "path": response.get("path", path),
+            "path": resolved_path,
             "items": items,
             "has_more": bool(response.get("has_more", False)),
             "page": page,

@@ -104,6 +104,11 @@ urlpatterns = [
         name="rename_file",
     ),
     path(
+        "<agent:agent_id>/files/transfers/",
+        views.list_file_transfers,
+        name="list_file_transfers",
+    ),
+    path(
         "<agent:agent_id>/files/upload/init/",
         views.init_file_upload,
         name="init_file_upload",

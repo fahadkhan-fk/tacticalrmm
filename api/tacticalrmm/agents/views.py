@@ -3158,6 +3158,66 @@ def cancel_file_upload(request, agent_id, session_id):
     return Response({"session_id": str(session.session_id), "status": session.status})
 
 
+def _parse_file_transfer_warnings(raw) -> list:
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return parsed
+    except (ValueError, TypeError):
+        pass
+    return []
+
+
+def _live_committed_offset(session: FileTransferSession) -> int:
+    """DB committed_offset refined by the live Redis ACK when present."""
+    if session.operation == FileTransferOperation.UPLOAD:
+        redis_committed = get_upload_ack(session.session_id)
+    else:
+        redis_committed = get_download_ack(session.session_id)
+    return max(session.committed_offset, redis_committed or 0)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated, AgentFileBrowserPerms])
+def list_file_transfers(request, agent_id):
+    """List resumable file-transfer sessions for the current user on this agent."""
+    agent = get_validated_agent(agent_id)
+    if isinstance(agent, Response):
+        return agent
+
+    sessions = FileTransferSession.objects.filter(
+        agent=agent,
+        user=request.user,
+        status__in=_FILE_TRANSFER_RESUMABLE_STATUSES,
+        expires_at__gt=djangotime.now(),
+    ).order_by("-updated_at")
+
+    transfers = []
+    for session in sessions:
+        item = {
+            "session_id": str(session.session_id),
+            "operation": session.operation,
+            "filename": session.filename,
+            "destination_path": session.destination_path,
+            "total_size": session.total_size,
+            "chunk_size": session.chunk_size,
+            "committed_offset": _live_committed_offset(session),
+            "status": session.status,
+            "expires_at": session.expires_at.isoformat(),
+            "is_archive": bool(session.is_archive),
+            "warnings": _parse_file_transfer_warnings(session.warnings),
+        }
+        if session.operation == FileTransferOperation.UPLOAD:
+            item["conflict_policy"] = (
+                session.conflict_policy or FileTransferConflictPolicy.REPLACE
+            )
+        transfers.append(item)
+
+    return Response({"transfers": transfers})
+
+
 @api_view(["GET"])
 @permission_classes([IsAuthenticated, AgentFileBrowserPerms])
 def get_file_download_status(request, agent_id, session_id):
@@ -3181,15 +3241,6 @@ def get_file_download_status(request, agent_id, session_id):
         session.status = FileTransferStatus.EXPIRED
         session.save(update_fields=["status", "updated_at"])
 
-    warnings: list = []
-    if session.warnings:
-        try:
-            parsed = json.loads(session.warnings)
-            if isinstance(parsed, list):
-                warnings = parsed
-        except (ValueError, TypeError):
-            warnings = []
-
     return Response(
         {
             "session_id": str(session.session_id),
@@ -3199,7 +3250,7 @@ def get_file_download_status(request, agent_id, session_id):
             "committed_offset": session.committed_offset,
             "filename": session.filename,
             "is_archive": session.is_archive,
-            "warnings": warnings,
+            "warnings": _parse_file_transfer_warnings(session.warnings),
             "error": session.error_message,
         }
     )

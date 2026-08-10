@@ -154,12 +154,14 @@ from .utils import (
     resolve_upload_destination_path,
     send_nats_command,
     send_nats_notification,
+    collect_file_transfer_paths,
     validate_file_browser_name,
     validate_file_browser_path,
     validate_file_browser_paths,
     sanitize_file_browser_name_filter,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
+    validate_file_transfer_source_path,
     derive_archive_download_filename,
 )
 
@@ -2569,7 +2571,7 @@ def init_file_download(request, agent_id):
         return _resume_file_download(request, agent, resume_session_id)
 
     source_path = (request.data.get("source_path") or "").strip()
-    path_err = validate_file_transfer_destination_path(source_path, agent.plat)
+    path_err = validate_file_transfer_source_path(source_path, agent.plat)
     if path_err:
         return notify_error(path_err)
 
@@ -2667,26 +2669,17 @@ def init_file_download_archive(request, agent_id):
         return agent
 
     raw_paths = request.data.get("paths")
-    if not isinstance(raw_paths, list) or not raw_paths:
-        return notify_error("paths must be a non-empty array")
-
-    if len(raw_paths) > FILE_BROWSER_MAX_ARCHIVE_PATHS:
-        return notify_error(
+    validated_paths, paths_err = collect_file_transfer_paths(
+        raw_paths,
+        agent.plat,
+        max_paths=FILE_BROWSER_MAX_ARCHIVE_PATHS,
+        max_exceeded_message=(
             f"Select at most {FILE_BROWSER_MAX_ARCHIVE_PATHS} paths for archive download"
-        )
-
-    validated_paths: list[str] = []
-    for raw_path in raw_paths:
-        path = str(raw_path or "").strip()
-        if not path:
-            continue
-        path_err = validate_file_transfer_destination_path(path, agent.plat)
-        if path_err:
-            return notify_error(f"Invalid path: {path_err}")
-        validated_paths.append(path)
-
-    if not validated_paths:
-        return notify_error("paths must contain at least one valid absolute path")
+        ),
+    )
+    if paths_err:
+        return notify_error(paths_err)
+    assert validated_paths is not None
 
     filename = derive_archive_download_filename(
         validated_paths, request.data.get("filename")

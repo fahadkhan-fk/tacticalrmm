@@ -19,6 +19,7 @@ from tacticalrmm.constants import (
     AlertSeverity,
     CheckStatus,
     CheckType,
+    FILE_BROWSER_MAX_ARCHIVE_PATHS,
     FILE_BROWSER_MAX_DELETE_PATHS,
     FILE_BROWSER_MAX_NAME_FILTER_LEN,
     MeshAgentIdent,
@@ -231,18 +232,35 @@ def is_posix_abs_path(s: str) -> bool:
 
 _INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*\x00')
 _WINDOWS_ABS_PATH_RE = re.compile(r"^(?:[a-zA-Z]:\\|\\\\[^\\]+\\[^\\]+)")
+_PATH_CONTROL_CHARS = ("\n", "\r", "\x00")
+_PATH_SHELL_META_CHARS = ('"', "'", "&", "|", ";")
 
 
-def validate_file_browser_name(raw_name, field: str = "name") -> Optional[str]:
-    """Validate a single file or folder name segment (mkdir / rename)."""
+def _path_has_traversal(path: str) -> bool:
+    parts = re.split(r"[\\/]+", path.strip())
+    return ".." in parts
+
+
+def validate_fs_name(
+    raw_name,
+    field: str = "name",
+    *,
+    ban_trailing_space_or_period: bool = True,
+) -> Optional[str]:
+    """
+    Validate a single filesystem name segment (mkdir / rename / upload filename).
+    """
     if raw_name is None or not str(raw_name).strip():
         return f"{field} is required"
 
-    name = str(raw_name)
-    if name.endswith(" ") or name.endswith("."):
-        return f"{field} cannot end with a space or a period"
+    if ban_trailing_space_or_period:
+        name = str(raw_name)
+        if name.endswith(" ") or name.endswith("."):
+            return f"{field} cannot end with a space or a period"
+        trimmed = name.strip()
+    else:
+        trimmed = str(raw_name).strip()
 
-    trimmed = name.strip()
     if trimmed in (".", ".."):
         return f"{field} is invalid"
     if len(trimmed) > 255:
@@ -252,41 +270,73 @@ def validate_file_browser_name(raw_name, field: str = "name") -> Optional[str]:
     return None
 
 
+def validate_file_browser_name(raw_name, field: str = "name") -> Optional[str]:
+    return validate_fs_name(raw_name, field=field, ban_trailing_space_or_period=True)
+
+
 def validate_file_transfer_filename(filename: str) -> Optional[str]:
-    name = (filename or "").strip()
-    if not name:
-        return "filename is required"
-    if name in (".", ".."):
-        return "filename is invalid"
-    if len(name) > 255:
-        return "filename is too long"
-    if any(ch in _INVALID_FILENAME_CHARS for ch in name):
-        return "filename contains invalid characters"
-    return None
+    return validate_fs_name(
+        filename, field="filename", ban_trailing_space_or_period=False
+    )
 
 
-def _path_has_traversal(path: str) -> bool:
-    parts = re.split(r"[\\/]+", path.strip())
-    return ".." in parts
-
-
-def validate_file_transfer_destination_path(path: str, plat: str) -> Optional[str]:
-    value = (path or "").strip()
+def validate_absolute_agent_path(
+    path: str,
+    plat: str,
+    *,
+    field: str = "path",
+    normalize: bool = False,
+    strict_shell_metas: bool = False,
+) -> Optional[str]:
+    """
+    Shared absolute path checks for File Browser and file transfer.
+    """
+    value = (
+        normalize_file_browser_path(path, plat) if normalize else (path or "").strip()
+    )
     if not value:
-        return "destination_path is required"
-    if any(x in value for x in ('"', "'", "\n", "\r", "&", "|", ";", "\x00")):
-        return "destination_path contains invalid characters"
+        return f"{field} is required"
+
+    forbidden = _PATH_CONTROL_CHARS
+    if strict_shell_metas:
+        forbidden = _PATH_CONTROL_CHARS + _PATH_SHELL_META_CHARS
+    if any(x in value for x in forbidden):
+        return f"{field} contains invalid characters"
     if _path_has_traversal(value):
-        return "destination_path must not contain path traversal"
+        return f"{field} must not contain path traversal"
 
     if plat == "windows":
         if not _WINDOWS_ABS_PATH_RE.match(value):
-            return "destination_path must be an absolute Windows path"
+            return f"{field} must be an absolute Windows path"
         return None
 
-    if not is_posix_abs_path(value):
-        return "destination_path must be an absolute path"
+    if strict_shell_metas:
+        if not is_posix_abs_path(value):
+            return f"{field} must be an absolute path"
+    elif not value.startswith("/"):
+        return f"{field} must be an absolute path"
     return None
+
+
+def validate_file_transfer_destination_path(path: str, plat: str) -> Optional[str]:
+    return validate_absolute_agent_path(
+        path,
+        plat,
+        field="destination_path",
+        normalize=False,
+        strict_shell_metas=True,
+    )
+
+
+def validate_file_transfer_source_path(path: str, plat: str) -> Optional[str]:
+    """Validate a download source path (same rules as destination, clearer field)."""
+    return validate_absolute_agent_path(
+        path,
+        plat,
+        field="source_path",
+        normalize=False,
+        strict_shell_metas=True,
+    )
 
 
 def resolve_upload_destination_path(
@@ -358,22 +408,13 @@ def parse_upload_content_range(
 
 
 def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
-    value = normalize_file_browser_path(path, plat)
-    if not value:
-        return "path is required"
-    if any(x in value for x in ("\n", "\r", "\x00")):
-        return "path contains invalid characters"
-    if _path_has_traversal(value):
-        return "path must not contain path traversal"
-
-    if plat == "windows":
-        if not _WINDOWS_ABS_PATH_RE.match(value):
-            return "path must be an absolute Windows path"
-        return None
-
-    if not value.startswith("/"):
-        return "path must be an absolute path"
-    return None
+    return validate_absolute_agent_path(
+        path,
+        plat,
+        field="path",
+        normalize=True,
+        strict_shell_metas=False,
+    )
 
 
 def sanitize_file_browser_name_filter(raw) -> Tuple[Optional[str], Optional[str]]:
@@ -493,6 +534,45 @@ def validate_file_browser_paths(paths, plat: str) -> Optional[str]:
         if path_err:
             return path_err
     return None
+
+
+def collect_file_transfer_paths(
+    paths,
+    plat: str,
+    *,
+    max_paths: int = FILE_BROWSER_MAX_ARCHIVE_PATHS,
+    max_exceeded_message: Optional[str] = None,
+) -> Tuple[Optional[list], Optional[str]]:
+    """
+    Validate and collect absolute paths for archive download.
+    """
+    if not isinstance(paths, list) or not paths:
+        return None, "paths must be a non-empty array"
+
+    if len(paths) > max_paths:
+        if max_exceeded_message:
+            return None, max_exceeded_message
+        return None, f"paths must not exceed {max_paths} items"
+
+    validated: list[str] = []
+    for raw_path in paths:
+        path = str(raw_path or "").strip()
+        if not path:
+            continue
+        path_err = validate_absolute_agent_path(
+            path,
+            plat,
+            field="path",
+            normalize=False,
+            strict_shell_metas=True,
+        )
+        if path_err:
+            return None, path_err
+        validated.append(path)
+
+    if not validated:
+        return None, "paths must contain at least one valid absolute path"
+    return validated, None
 
 
 def normalize_file_browser_delete_results(raw_results) -> list:

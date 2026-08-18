@@ -131,11 +131,12 @@ from .tasks import (
 from .file_transfer_relay import (
     clear_download_session_redis,
     clear_upload_session_redis,
+    delete_download_chunk,
     get_accepted_offset,
     get_download_ack,
     get_download_offered_offset,
     get_upload_ack,
-    pop_download_chunk,
+    peek_download_chunk,
     rollback_upload_chunk,
     signal_download_ack,
     store_upload_chunk,
@@ -2824,7 +2825,7 @@ def get_file_download_chunk(request, agent_id, session_id):
             return notify_error(session.error_message or "Download failed")
         return notify_error("Timed out waiting for agent to push chunk")
 
-    chunk = pop_download_chunk(session.session_id, committed)
+    chunk = peek_download_chunk(session.session_id, committed)
     if chunk is None:
         return notify_error("Chunk vanished from relay buffer")
 
@@ -2907,6 +2908,9 @@ def ack_file_download_chunk(request, agent_id, session_id):
             session.status = FileTransferStatus.TRANSFERRING
             update_fields.append("status")
         session.save(update_fields=update_fields)
+
+    if committed_offset > current_committed:
+        delete_download_chunk(session.session_id, current_committed)
 
     signal_download_ack(session.session_id, committed_offset)
 

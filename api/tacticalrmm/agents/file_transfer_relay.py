@@ -53,6 +53,18 @@ redis.call('DEL', KEYS[1], KEYS[2])
 return {meta, data}
 """
 
+_PEEK_CHUNK_SCRIPT = """
+local meta = redis.call('GET', KEYS[1])
+if not meta then
+    return {false}
+end
+local data = redis.call('GET', KEYS[2])
+if not data then
+    return {false}
+end
+return {meta, data}
+"""
+
 
 @lru_cache(maxsize=1)
 def _redis_client() -> Redis:
@@ -67,6 +79,11 @@ def _store_chunk_redis_script():
 @lru_cache(maxsize=1)
 def _pop_chunk_redis_script():
     return _redis_client().register_script(_POP_CHUNK_SCRIPT)
+
+
+@lru_cache(maxsize=1)
+def _peek_chunk_redis_script():
+    return _redis_client().register_script(_PEEK_CHUNK_SCRIPT)
 
 
 def _chunk_prefix(session_id: UUID) -> str:
@@ -333,12 +350,12 @@ def store_download_chunk(
     return None
 
 
-def pop_download_chunk(session_id: UUID, start: int) -> Optional[PendingDownloadChunk]:
-    """Atomically fetch-and-delete the download chunk stored at `start`."""
+def peek_download_chunk(session_id: UUID, start: int) -> Optional[PendingDownloadChunk]:
+    """Fetch the download chunk stored at `start` without deleting it."""
     meta_key = _dl_chunk_meta_key_at(session_id, start)
     data_key = _dl_chunk_data_key_at(session_id, start)
 
-    result = _pop_chunk_redis_script()(keys=[meta_key, data_key])
+    result = _peek_chunk_redis_script()(keys=[meta_key, data_key])
 
     if not result or result[0] is False or result[0] is None:
         return None
@@ -349,6 +366,14 @@ def pop_download_chunk(session_id: UUID, start: int) -> Optional[PendingDownload
         start=int(meta["start"]),
         end=int(meta["end"]),
         data=data,
+    )
+
+
+def delete_download_chunk(session_id: UUID, start: int) -> None:
+    """Drop the buffered download chunk stored at `start`."""
+    _redis_client().delete(
+        _dl_chunk_meta_key_at(session_id, start),
+        _dl_chunk_data_key_at(session_id, start),
     )
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-SCRIPT_VERSION="159"
+SCRIPT_VERSION="160"
 SCRIPT_URL='https://raw.githubusercontent.com/amidaware/tacticalrmm/master/update.sh'
 LATEST_SETTINGS_URL='https://raw.githubusercontent.com/amidaware/tacticalrmm/master/api/tacticalrmm/tacticalrmm/settings.py'
 YELLOW='\033[1;33m'
@@ -10,7 +10,7 @@ NC='\033[0m'
 THIS_SCRIPT=$(readlink -f "$0")
 
 SCRIPTS_DIR='/opt/trmm-community-scripts'
-PYTHON_VER='3.11.8'
+PYTHON_VER='3.12.13'
 SETTINGS_FILE='/rmm/api/tacticalrmm/tacticalrmm/settings.py'
 local_settings='/rmm/api/tacticalrmm/tacticalrmm/local_settings.py'
 
@@ -272,8 +272,8 @@ if ! sudo nginx -t >/dev/null 2>&1; then
   exit 1
 fi
 
-HAS_PY311=$(python3.11 --version | grep ${PYTHON_VER})
-if ! [[ $HAS_PY311 ]]; then
+HAS_PY312=$(python3.12 --version | grep ${PYTHON_VER})
+if ! [[ $HAS_PY312 ]]; then
   printf >&2 "${GREEN}Updating to ${PYTHON_VER}${NC}\n"
   sudo apt install -y build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev libsqlite3-dev libbz2-dev
   numprocs=$(nproc)
@@ -339,10 +339,64 @@ if ! which npm >/dev/null; then
   cd /meshcentral
   rm -rf node_modules/ package-lock.json
   npm install
+  sudo systemctl start nginx
+  sleep 1
   sudo systemctl start meshcentral
 fi
 
 sudo npm install -g npm
+
+# disable compression if set to fix some mesh issues
+mesh_cfg='/meshcentral/meshcentral-data/config.json'
+
+check_jq_filter='
+( .settings // {} ) |
+to_entries |
+map(
+    select((.key | ascii_downcase) | IN("compression", "wscompression", "agentwscompression"))
+) |
+all(.value == false)
+'
+
+apply_jq_filter='
+.settings |= (
+    with_entries(
+        if ((.key | ascii_downcase) | IN("compression", "wscompression", "agentwscompression")) then
+            .value = false
+        else
+            .
+        end
+    )
+)
+'
+
+if ! which jq >/dev/null; then
+  echo "installing jq"
+  sudo apt-get install -y jq >/dev/null
+fi
+
+if which jq >/dev/null; then
+  if ! jq -e "$check_jq_filter" "$mesh_cfg" >/dev/null; then
+    echo "Disabling mesh compression"
+    # backup to homedir first
+    cp "$mesh_cfg" ~/meshcfg-$(date "+%Y%m%dT%H%M%S").bak
+    mesh_tmp=$(mktemp)
+    if jq "$apply_jq_filter" "$mesh_cfg" >"$mesh_tmp"; then
+      if [ -s "$mesh_tmp" ]; then
+        mv "$mesh_tmp" "$mesh_cfg"
+      fi
+    fi
+    rm -f "$mesh_tmp"
+  fi
+fi
+
+if which jq >/dev/null; then
+  cp "$mesh_cfg" ~/meshcfg${CURRENT_TRMM_VER}-$(date "+%Y%m%dT%H%M%S").bak
+  mesh_tmp2=$(mktemp)
+  if jq '.settings.autoBackup = false' "$mesh_cfg" >"$mesh_tmp2" && [ -s "$mesh_tmp2" ]; then
+    mv "$mesh_tmp2" "$mesh_cfg"
+  fi
+fi
 
 CURRENT_MESH_VER=$(cd /meshcentral/node_modules/meshcentral && node -p -e "require('./package.json').version")
 if [[ "${CURRENT_MESH_VER}" != "${LATEST_MESH_VER}" ]] || [[ "$force" = true ]]; then
@@ -357,7 +411,7 @@ if [[ "${CURRENT_MESH_VER}" != "${LATEST_MESH_VER}" ]] || [[ "$force" = true ]];
   "dependencies": {
     "archiver": "7.0.1",
     "meshcentral": "${LATEST_MESH_VER}",
-    "otplib": "12.0.1",
+    "otplib": "13.4.1",
     "pg": "8.16.3"
   }
 }
@@ -365,6 +419,8 @@ EOF
   )"
   echo "${mesh_pkg}" >/meshcentral/package.json
   npm install
+  sudo systemctl start nginx
+  sleep 1
   sudo systemctl start meshcentral
 fi
 
@@ -439,7 +495,7 @@ sudo chmod +x $nats_api
 if [[ "${CURRENT_PIP_VER}" != "${LATEST_PIP_VER}" ]] || [[ "$force" = true ]]; then
   rm -rf /rmm/api/env
   cd /rmm/api
-  python3.11 -m venv env
+  python3.12 -m venv env
   source /rmm/api/env/bin/activate
   cd /rmm/api/tacticalrmm
   pip install --no-cache-dir pip==25.1
@@ -632,64 +688,11 @@ echo "window._env_ = {PROD_URL: \"https://${API}\"}" | sudo tee /var/www/rmm/dis
 sudo chown www-data:www-data -R /var/www/rmm/dist
 rm -f /tmp/${webtar}
 
-# disable compression if set to fix some mesh issues
-mesh_cfg='/meshcentral/meshcentral-data/config.json'
-
-check_jq_filter='
-( .settings // {} ) |
-to_entries |
-map(
-    select((.key | ascii_downcase) | IN("compression", "wscompression", "agentwscompression"))
-) |
-all(.value == false)
-'
-
-apply_jq_filter='
-.settings |= (
-    with_entries(
-        if ((.key | ascii_downcase) | IN("compression", "wscompression", "agentwscompression")) then
-            .value = false
-        else
-            .
-        end
-    )
-)
-'
-
-if ! which jq >/dev/null; then
-  echo "installing jq"
-  sudo apt-get install -y jq >/dev/null
-fi
-
-if which jq >/dev/null; then
-  if ! jq -e "$check_jq_filter" "$mesh_cfg" >/dev/null; then
-    echo "Disabling mesh compression"
-    # backup to homedir first
-    cp "$mesh_cfg" ~/meshcfg-$(date "+%Y%m%dT%H%M%S").bak
-    mesh_tmp=$(mktemp)
-    if jq "$apply_jq_filter" "$mesh_cfg" >"$mesh_tmp"; then
-      if [ -s "$mesh_tmp" ]; then
-        mv "$mesh_tmp" "$mesh_cfg"
-        sudo systemctl restart meshcentral
-      fi
-    fi
-    rm -f "$mesh_tmp"
-  fi
-fi
-
-if which jq >/dev/null; then
-	cp "$mesh_cfg" ~/meshcfg1.4.0-$(date "+%Y%m%dT%H%M%S").bak
-	mesh_tmp2=$(mktemp)
-	if jq '.settings.noAgentUpdate = true | .settings.autoBackup = false' "$mesh_cfg" >"$mesh_tmp2" && [ -s "$mesh_tmp2" ]; then
-		mv "$mesh_tmp2" "$mesh_cfg"
-		sudo systemctl restart meshcentral
-	fi
-fi
-
 for i in nats nats-api rmm daphne celery celerybeat nginx; do
   printf >&2 "${GREEN}Starting ${i} service${NC}\n"
   sudo systemctl start ${i}
 done
 
 rm -f $TMP_SETTINGS
+sudo systemctl reload nginx
 printf >&2 "${GREEN}Update finished!${NC}\n"

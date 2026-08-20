@@ -26,6 +26,7 @@ from rest_framework.views import APIView
 
 from agents.utils import get_agent_url
 from core.models import CoreSettings
+from core.permissions import RunServerScriptPerms
 from core.tasks import sync_mesh_perms_task
 from core.utils import (
     get_core_settings,
@@ -860,7 +861,7 @@ def install_agent(request):
                 "ping",
                 "127.0.0.1",
                 "-n",
-                "5",
+                "7",
                 "&&",
                 r'"C:\Program Files\TacticalAgent\tacticalrmm.exe"',
             ] + install_flags
@@ -952,8 +953,12 @@ def run_script(request, agent_id):
     req_timeout = int(request.data["timeout"]) + 3
     run_on_server: bool | None = request.data.get("run_on_server")
 
-    if run_on_server and not get_core_settings().server_scripts_enabled:
-        return notify_error("This feature is disabled.")
+    if run_on_server:
+        if not get_core_settings().server_scripts_enabled:
+            return notify_error("This feature is disabled.")
+
+        if not RunServerScriptPerms().has_permission(request, None):
+            raise PermissionDenied()
 
     AuditLog.audit_script_run(
         username=request.user.username,

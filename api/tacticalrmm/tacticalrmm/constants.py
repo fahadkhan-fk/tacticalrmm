@@ -682,6 +682,11 @@ class TerminalModeChoices(models.TextChoices):
     LEGACY = "legacy", "Use legacy terminal"
 
 
+class FileBrowserModeChoices(models.TextChoices):
+    NEW = "new", "Use new file browser"
+    LEGACY = "legacy", "Use legacy file browser"
+
+
 class FileTransferOperation(models.TextChoices):
     UPLOAD = "upload", "Upload"
     DOWNLOAD = "download", "Download"

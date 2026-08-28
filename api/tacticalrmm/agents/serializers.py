@@ -5,6 +5,7 @@ from tacticalrmm.constants import (
     AGENT_CHECKS_CACHE_PREFIX,
     AGENT_STATUS_ONLINE,
     ALL_TIMEZONES,
+    FileBrowserModeChoices,
     TerminalModeChoices,
 )
 from winupdate.serializers import WinUpdatePolicySerializer
@@ -256,4 +257,26 @@ class AgentTerminalDefaultsSerializer(serializers.ModelSerializer):
             "effective_default_shell",
             "terminal_mode",
             "supports_new_terminal",
+        )
+
+
+class AgentFileBrowserDefaultsSerializer(serializers.ModelSerializer):
+    file_browser_mode = serializers.SerializerMethodField()
+    supports_new_file_browser = serializers.SerializerMethodField()
+
+    def get_file_browser_mode(self, obj):
+        settings = self.context.get("core_settings")
+        return settings.file_browser_mode if settings else FileBrowserModeChoices.NEW
+
+    def get_supports_new_file_browser(self, obj):
+        return self.context.get("supports_new_file_browser", True)
+
+    class Meta:
+        model = Agent
+        fields = (
+            "agent_id",
+            "hostname",
+            "plat",
+            "file_browser_mode",
+            "supports_new_file_browser",
         )

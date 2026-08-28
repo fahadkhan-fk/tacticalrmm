@@ -122,6 +122,7 @@ from .serializers import (
     AgentNoteSerializer,
     AgentSerializer,
     AgentTableSerializer,
+    AgentFileBrowserDefaultsSerializer,
     AgentTerminalDefaultsSerializer,
 )
 from .tasks import (
@@ -3312,6 +3313,31 @@ class AgentTerminalDefaults(APIView):
                 context={
                     "core_settings": core_settings,
                     "supports_new_terminal": supports_new_terminal,
+                },
+            ).data
+        )
+
+
+class AgentFileBrowserDefaults(APIView):
+    permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
+
+    def get(self, request, agent_id):
+        agent = get_object_or_404(
+            Agent.objects.filter_by_role(request.user).defer(*AGENT_DEFER),
+            agent_id=agent_id,
+        )
+
+        supports_new_file_browser = True
+        if pyver.parse(agent.version) < pyver.parse("2.12.0"):
+            supports_new_file_browser = False
+
+        core_settings = CoreSettings.objects.only("file_browser_mode").first()
+        return Response(
+            AgentFileBrowserDefaultsSerializer(
+                agent,
+                context={
+                    "core_settings": core_settings,
+                    "supports_new_file_browser": supports_new_file_browser,
                 },
             ).data
         )

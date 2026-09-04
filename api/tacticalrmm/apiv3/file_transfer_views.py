@@ -13,6 +13,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from agents.file_transfer_relay import (
+    clear_download_session_redis,
+    clear_upload_session_redis,
     get_accepted_offset,
     get_download_ack,
     get_download_offered_offset,
@@ -297,6 +299,56 @@ class FileTransferDownloadPutChunk(APIView):
                 "chunk_bytes": len(chunk_data),
             }
         )
+
+
+class FileTransferFail(APIView):
+    """When the download stream (or other agent-side work) hits a final
+    failure so the session does not sit in ``transferring`` with an empty
+    error until TTL/Celery. Idempotent for already-terminal sessions."""
+
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, session_id):
+        agent = getattr(request.user, "agent", None)
+        if agent is None:
+            return Response(
+                "Invalid agent credentials",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        session = get_object_or_404(
+            FileTransferSession,
+            session_id=session_id,
+            agent=agent,
+        )
+
+        if session.status in _TERMINAL_STATUSES:
+            return Response(
+                {"status": session.status},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        error = (request.data.get("error") or "").strip()
+        if not error:
+            error = "Agent reported transfer failure"
+        error = error[:2048]
+
+        if session.operation == FileTransferOperation.DOWNLOAD:
+            clear_download_session_redis(session.session_id)
+        else:
+            clear_upload_session_redis(session.session_id)
+
+        session.status = FileTransferStatus.FAILED
+        session.error_message = error
+        session.save(update_fields=["status", "error_message", "updated_at"])
+        logger.warning(
+            "file_transfer agent fail session=%s operation=%s: %s",
+            session.session_id,
+            session.operation,
+            error,
+        )
+        return Response({"status": "failed"})
 
 
 class FileTransferArchiveReady(APIView):

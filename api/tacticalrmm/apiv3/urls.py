@@ -19,6 +19,11 @@ urlpatterns = [
         name="file_transfer_download_put_chunk",
     ),
     path(
+        "file-transfers/<uuid:session_id>/fail/",
+        file_transfer_views.FileTransferFail.as_view(),
+        name="file_transfer_fail",
+    ),
+    path(
         "file-transfers/<uuid:session_id>/archive-ready/",
         file_transfer_views.FileTransferArchiveReady.as_view(),
         name="file_transfer_archive_ready",

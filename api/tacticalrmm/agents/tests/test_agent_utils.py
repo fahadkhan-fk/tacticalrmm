@@ -5,9 +5,16 @@ from django.conf import settings
 from django.test import SimpleTestCase
 
 from agents.utils import (
+    collect_file_transfer_paths,
     generate_linux_install,
     get_agent_url,
+    is_posix_abs_path,
+    is_windows_path,
     strip_relation_caches_for_cache,
+    validate_file_browser_path,
+    validate_file_transfer_destination_path,
+    validate_file_transfer_filename,
+    validate_file_transfer_source_path,
 )
 from automation.models import Policy
 from checks.models import Check
@@ -96,3 +103,62 @@ class TestAgentUtils(TacticalTestCase):
         self.assertIn(r"clientID='1'", ret)
         self.assertIn(r"siteID='1'", ret)
         self.assertIn(r"agentType='server'", ret)
+
+
+class TestFileTransferPathValidation(SimpleTestCase):
+    """Transfer paths must match listing: apostrophe/ampersand/etc are valid names."""
+
+    def test_transfer_allows_shell_meta_chars_in_paths(self) -> None:
+        windows_dir = r"C:\Users\John's Docs"
+        windows_file = r"C:\Users\John's Docs\it's & co.txt"
+        posix_dir = "/tmp/it's & co"
+        posix_file = "/tmp/it's & co/x.txt;done"
+
+        self.assertIsNone(
+            validate_file_transfer_destination_path(windows_dir, "windows")
+        )
+        self.assertIsNone(
+            validate_file_transfer_destination_path(windows_file, "windows")
+        )
+        self.assertIsNone(validate_file_transfer_source_path(windows_file, "windows"))
+        self.assertIsNone(validate_file_browser_path(windows_dir, "windows"))
+
+        self.assertIsNone(validate_file_transfer_destination_path(posix_dir, "linux"))
+        self.assertIsNone(validate_file_transfer_source_path(posix_file, "linux"))
+        self.assertIsNone(validate_file_browser_path(posix_dir, "linux"))
+        self.assertIsNone(validate_file_transfer_filename("it's & co.txt"))
+
+        paths, err = collect_file_transfer_paths(
+            [posix_file, '/tmp/quote"file.txt'], "linux"
+        )
+        self.assertIsNone(err)
+        self.assertEqual(len(paths), 2)
+
+        paths, err = collect_file_transfer_paths(
+            [r"C:\Users\John's Docs", r"C:\Users\a|b"], "windows"
+        )
+        self.assertIsNone(err)
+        self.assertEqual(len(paths), 2)
+
+    def test_transfer_still_rejects_control_traversal_and_relative(self) -> None:
+        self.assertIsNotNone(
+            validate_file_transfer_destination_path("Public", "windows")
+        )
+        self.assertIsNotNone(validate_file_transfer_source_path("readme.txt", "linux"))
+        self.assertIsNotNone(
+            validate_file_transfer_destination_path(r"C:\Users\..\Windows", "windows")
+        )
+        self.assertIsNotNone(
+            validate_file_transfer_source_path("/tmp/foo\nbar", "linux")
+        )
+        self.assertIsNotNone(
+            validate_file_transfer_destination_path("/tmp/foo\x00bar", "linux")
+        )
+
+    def test_shell_helpers_still_ban_metas(self) -> None:
+        """Custom shell fields still must not contain injection characters."""
+        self.assertFalse(is_posix_abs_path("/bin/bash;id"))
+        self.assertFalse(is_posix_abs_path("/tmp/it's"))
+        self.assertTrue(is_posix_abs_path("/bin/bash"))
+        self.assertFalse(is_windows_path(r"C:\Program Files\it's.exe"))
+        self.assertTrue(is_windows_path(r"C:\Windows\System32\cmd.exe"))

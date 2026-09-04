@@ -257,7 +257,6 @@ def is_posix_abs_path(s: str) -> bool:
 _INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*\x00')
 _WINDOWS_ABS_PATH_RE = re.compile(r"^(?:[a-zA-Z]:\\|\\\\[^\\]+\\[^\\]+)")
 _PATH_CONTROL_CHARS = ("\n", "\r", "\x00")
-_PATH_SHELL_META_CHARS = ('"', "'", "&", "|", ";")
 
 
 def _path_has_traversal(path: str) -> bool:
@@ -310,7 +309,6 @@ def validate_absolute_agent_path(
     *,
     field: str = "path",
     normalize: bool = False,
-    strict_shell_metas: bool = False,
 ) -> Optional[str]:
     """
     Shared absolute path checks for File Browser and file transfer.
@@ -321,10 +319,7 @@ def validate_absolute_agent_path(
     if not value:
         return f"{field} is required"
 
-    forbidden = _PATH_CONTROL_CHARS
-    if strict_shell_metas:
-        forbidden = _PATH_CONTROL_CHARS + _PATH_SHELL_META_CHARS
-    if any(x in value for x in forbidden):
+    if any(x in value for x in _PATH_CONTROL_CHARS):
         return f"{field} contains invalid characters"
     if _path_has_traversal(value):
         return f"{field} must not contain path traversal"
@@ -334,10 +329,7 @@ def validate_absolute_agent_path(
             return f"{field} must be an absolute Windows path"
         return None
 
-    if strict_shell_metas:
-        if not is_posix_abs_path(value):
-            return f"{field} must be an absolute path"
-    elif not value.startswith("/"):
+    if not value.startswith("/"):
         return f"{field} must be an absolute path"
     return None
 
@@ -348,7 +340,6 @@ def validate_file_transfer_destination_path(path: str, plat: str) -> Optional[st
         plat,
         field="destination_path",
         normalize=False,
-        strict_shell_metas=True,
     )
 
 
@@ -359,7 +350,6 @@ def validate_file_transfer_source_path(path: str, plat: str) -> Optional[str]:
         plat,
         field="source_path",
         normalize=False,
-        strict_shell_metas=True,
     )
 
 
@@ -437,7 +427,6 @@ def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
         plat,
         field="path",
         normalize=True,
-        strict_shell_metas=False,
     )
 
 
@@ -588,7 +577,6 @@ def collect_file_transfer_paths(
             plat,
             field="path",
             normalize=False,
-            strict_shell_metas=True,
         )
         if path_err:
             return None, path_err

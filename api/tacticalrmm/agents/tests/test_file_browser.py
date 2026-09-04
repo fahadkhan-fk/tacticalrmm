@@ -530,6 +530,26 @@ class TestInitFileUpload(BaseFileBrowserAPITest):
         self.assertIn("destination_path", response.json())
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_init_file_upload_allows_apostrophe_in_path(self, mock_nats_cmd) -> None:
+        """Should upload into folders like John's Docs."""
+        mock_nats_cmd.return_value = {"status": "ready", "committed_offset": 0}
+        response = self.client.post(
+            self.url,
+            self._upload_payload(
+                filename="it's & co.txt",
+                destination_path=r"C:\Users\John's Docs",
+            ),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        session = FileTransferSession.objects.get(
+            session_id=response.json()["session_id"]
+        )
+        self.assertEqual(
+            session.destination_path, r"C:\Users\John's Docs\it's & co.txt"
+        )
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_init_file_upload_success(self, mock_nats_cmd) -> None:
         """Should create a session and return agent-ready offsets."""
         mock_nats_cmd.return_value = {"status": "ready", "committed_offset": 0}
@@ -662,6 +682,23 @@ class TestInitFileDownload(BaseFileBrowserAPITest):
         self.assertIn("source_path", response.json())
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_init_file_download_allows_apostrophe_in_path(self, mock_nats_cmd) -> None:
+        """Should download files from folders like John's Docs."""
+        mock_nats_cmd.return_value = {"status": "ready", "total_size": 2048}
+        response = self.client.post(
+            self.url,
+            {"source_path": r"C:\Users\John's Docs\it's & co.txt"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        session = FileTransferSession.objects.get(
+            session_id=response.json()["session_id"]
+        )
+        self.assertEqual(
+            session.destination_path, r"C:\Users\John's Docs\it's & co.txt"
+        )
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_init_file_download_success(self, mock_nats_cmd) -> None:
         """Should create a download session when agent reports ready + size."""
         mock_nats_cmd.return_value = {"status": "ready", "total_size": 2048}
@@ -750,6 +787,17 @@ class TestInitFileDownloadArchive(BaseFileBrowserAPITest):
             mock_nats_cmd.call_args[0][0]["func"],
             "files_download_archive_prepare",
         )
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_init_archive_allows_apostrophe_in_paths(self, mock_nats_cmd) -> None:
+        """ZIP download must accept the same names listing/mkdir already allow."""
+        mock_nats_cmd.return_value = {"status": "building"}
+        response = self.client.post(
+            self.url,
+            {"paths": [r"C:\Users\John's Docs", r"C:\Users\Public\a;b.txt"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_init_archive_agent_error(self, mock_nats_cmd) -> None:

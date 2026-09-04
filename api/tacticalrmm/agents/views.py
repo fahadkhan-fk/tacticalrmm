@@ -72,6 +72,7 @@ from tacticalrmm.constants import (
     AgentMonType,
     AgentPlat,
     AgentTerminalShellChoices,
+    AuditActionType,
     CustomFieldModel,
     DebugLogType,
     EvtLogNames,
@@ -168,7 +169,7 @@ from .utils import (
     derive_archive_download_filename,
 )
 
-logger = logging.getLogger("trmm_file_transfer")
+logger = logging.getLogger("trmm.file_transfer")
 
 
 class GetAgents(APIView):
@@ -1962,6 +1963,29 @@ class GetFileProperties(APIView):
         return Response(item)
 
 
+def _audit_file_browser(request, agent, action: str, operation: str, paths, extra=None):
+    AuditLog.audit_file_browser_action(
+        username=request.user.username,
+        agent=agent,
+        action=action,
+        operation=operation,
+        paths=list(paths),
+        debug_info={"ip": getattr(request, "_client_ip", "")},
+        extra=extra,
+    )
+
+
+def _log_transfer_terminal(session: FileTransferSession, detail: str = "") -> None:
+    message = detail or session.error_message or session.status
+    logger.error(
+        "file_transfer session=%s operation=%s status=%s: %s",
+        session.session_id,
+        session.operation,
+        session.status,
+        message,
+    )
+
+
 class CreateFileFolder(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
@@ -2003,6 +2027,14 @@ class CreateFileFolder(APIView):
         if not item:
             return notify_error("Invalid agent response")
 
+        _audit_file_browser(
+            request,
+            agent,
+            AuditActionType.ADD,
+            "mkdir",
+            [item.get("path") or path],
+            extra={"name": name, "parent": path},
+        )
         return Response({"status": "success", "item": item})
 
 
@@ -2047,6 +2079,14 @@ class RenameFile(APIView):
         if not item:
             return notify_error("Invalid agent response")
 
+        _audit_file_browser(
+            request,
+            agent,
+            AuditActionType.MODIFY,
+            "rename",
+            [path],
+            extra={"new_name": new_name, "item_path": item.get("path")},
+        )
         return Response({"status": "success", "item": item})
 
 
@@ -2077,6 +2117,14 @@ def _delete_agent_files(request, agent_id):
     if not results:
         return notify_error("Invalid agent response")
 
+    _audit_file_browser(
+        request,
+        agent,
+        AuditActionType.DELETE,
+        "delete",
+        normalized_paths,
+        extra={"results": results},
+    )
     return Response({"status": "success", "results": results})
 
 
@@ -2214,6 +2262,18 @@ class InitFileUpload(APIView):
         session.committed_offset = committed_offset
         session.save(update_fields=["status", "committed_offset", "updated_at"])
 
+        _audit_file_browser(
+            request,
+            agent,
+            AuditActionType.FILE_TRANSFER,
+            "upload",
+            [session.destination_path],
+            extra={
+                "session_id": str(session.session_id),
+                "filename": session.filename,
+                "total_size": session.total_size,
+            },
+        )
         return Response(
             {
                 "session_id": str(session.session_id),
@@ -2671,6 +2731,18 @@ class InitFileDownload(APIView):
         session.status = FileTransferStatus.AGENT_READY
         session.save(update_fields=["total_size", "status", "updated_at"])
 
+        _audit_file_browser(
+            request,
+            agent,
+            AuditActionType.FILE_TRANSFER,
+            "download",
+            [source_path],
+            extra={
+                "session_id": str(session.session_id),
+                "filename": session.filename,
+                "total_size": total_size,
+            },
+        )
         return Response(
             {
                 "session_id": str(session.session_id),
@@ -2784,8 +2856,20 @@ class InitFileDownloadArchive(APIView):
             session.status = FileTransferStatus.FAILED
             session.error_message = str(error_message)
             session.save(update_fields=["status", "error_message", "updated_at"])
+            _log_transfer_terminal(session)
             return notify_error(str(error_message))
 
+        _audit_file_browser(
+            request,
+            agent,
+            AuditActionType.FILE_TRANSFER,
+            "archive_download",
+            validated_paths,
+            extra={
+                "session_id": str(session.session_id),
+                "filename": filename,
+            },
+        )
         return Response(
             {
                 "session_id": str(session.session_id),
@@ -3067,6 +3151,7 @@ def _release_download_session(
     session.status = new_status
     session.error_message = error_message
     session.save(update_fields=["status", "error_message", "updated_at"])
+    _log_transfer_terminal(session, error_message)
 
 
 def _release_upload_session(
@@ -3087,6 +3172,7 @@ def _release_upload_session(
     session.status = new_status
     session.error_message = error_message
     session.save(update_fields=["status", "error_message", "updated_at"])
+    _log_transfer_terminal(session, error_message)
 
 
 class CancelFileDownload(APIView):
@@ -3128,13 +3214,6 @@ class CancelFileDownload(APIView):
             agent,
             error_message=error_message,
             new_status=new_status,
-        )
-        logger.info(
-            "file_transfer download %s session=%s agent=%s user=%s",
-            "released" if reason == "error" else "cancelled",
-            session.session_id,
-            agent.agent_id,
-            request.user.pk,
         )
         return Response(
             {"session_id": str(session.session_id), "status": session.status}
@@ -3180,13 +3259,6 @@ class CancelFileUpload(APIView):
             agent,
             error_message=error_message,
             new_status=new_status,
-        )
-        logger.info(
-            "file_transfer upload %s session=%s agent=%s user=%s",
-            "released" if reason == "error" else "cancelled",
-            session.session_id,
-            agent.agent_id,
-            request.user.pk,
         )
         return Response(
             {"session_id": str(session.session_id), "status": session.status}

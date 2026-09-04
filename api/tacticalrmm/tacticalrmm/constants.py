@@ -295,6 +295,7 @@ class AuditActionType(models.TextChoices):
     REMOTE_SESSION = "remote_session", "Remote Session"
     EXEC_SCRIPT = "execute_script", "Execute Script"
     EXEC_COMMAND = "execute_command", "Execute Command"
+    FILE_TRANSFER = "file_transfer", "File Transfer"
     BULK_ACTION = "bulk_action", "Bulk Action"
     URL_ACTION = "url_action", "URL Action"
 

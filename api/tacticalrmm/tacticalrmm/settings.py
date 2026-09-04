@@ -451,5 +451,10 @@ LOGGING = {
     "loggers": {
         "django.request": {"handlers": ["file"], "level": "ERROR", "propagate": True},
         "trmm": {"handlers": ["trmm"], "level": get_log_level(), "propagate": False},
+        "trmm.file_transfer": {
+            "handlers": ["trmm"],
+            "level": get_log_level(),
+            "propagate": False,
+        },
     },
 }

@@ -37,7 +37,7 @@ from tacticalrmm.constants import (
 )
 from tacticalrmm.helpers import notify_error
 
-logger = logging.getLogger("trmm_file_transfer")
+logger = logging.getLogger("trmm.file_transfer")
 
 _TERMINAL_STATUSES = (
     FileTransferStatus.COMPLETED,
@@ -342,7 +342,7 @@ class FileTransferFail(APIView):
         session.status = FileTransferStatus.FAILED
         session.error_message = error
         session.save(update_fields=["status", "error_message", "updated_at"])
-        logger.warning(
+        logger.error(
             "file_transfer agent fail session=%s operation=%s: %s",
             session.session_id,
             session.operation,
@@ -383,7 +383,7 @@ class FileTransferArchiveReady(APIView):
             session.status = FileTransferStatus.FAILED
             session.error_message = error[:2048]
             session.save(update_fields=["status", "error_message", "updated_at"])
-            logger.info(
+            logger.error(
                 "file_transfer archive build failed session=%s: %s",
                 session.session_id,
                 session.error_message,

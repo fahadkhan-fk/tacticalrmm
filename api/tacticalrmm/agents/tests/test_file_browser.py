@@ -8,11 +8,13 @@ from model_bakery import baker
 from rest_framework import status
 
 from agents.models import Agent, FileTransferSession
+from logs.models import AuditLog
 from tacticalrmm.constants import (
     FILE_BROWSER_DEFAULT_PAGE_SIZE,
     FILE_BROWSER_MAX_PAGE_SIZE,
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
+    AuditActionType,
     FileTransferConflictPolicy,
     FileTransferOperation,
     FileTransferStatus,
@@ -274,6 +276,9 @@ class TestListFiles(BaseFileBrowserAPITest):
         mock_nats_cmd.assert_called_once()
         call_args = mock_nats_cmd.call_args[0][0]
         self.assertEqual(call_args["func"], "files_delete")
+        log = AuditLog.objects.get(action=AuditActionType.DELETE)
+        self.assertEqual(log.after_value["operation"], "delete")
+        self.assertEqual(len(log.after_value["paths"]), 2)
 
     def test_delete_files_missing_paths(self) -> None:
         """Should require a non-empty paths list."""
@@ -386,6 +391,10 @@ class TestCreateFileFolder(BaseFileBrowserAPITest):
             },
             timeout=30,
         )
+        log = AuditLog.objects.get(action=AuditActionType.ADD)
+        self.assertEqual(log.agent_id, self.agent.agent_id)
+        self.assertEqual(log.after_value["operation"], "mkdir")
+        self.assertIn("ip", log.debug_info)
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_create_file_folder_agent_error(self, mock_nats_cmd) -> None:
@@ -398,6 +407,7 @@ class TestCreateFileFolder(BaseFileBrowserAPITest):
         )
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json(), "Folder already exists")
+        self.assertFalse(AuditLog.objects.filter(action=AuditActionType.ADD).exists())
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_create_file_folder_timeout(self, mock_nats_cmd) -> None:
@@ -463,9 +473,9 @@ class TestRenameFile(BaseFileBrowserAPITest):
             },
             timeout=30,
         )
-
-    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
-    def test_rename_file_nats_failure(self, mock_nats_cmd: AsyncMock) -> None:
+        log = AuditLog.objects.get(action=AuditActionType.MODIFY)
+        self.assertEqual(log.after_value["operation"], "rename")
+        self.assertEqual(log.after_value["new_name"], "renamed.txt")
         """Should handle NATS communication error."""
         mock_nats_cmd.side_effect = Exception("NATS down")
         response = self.client.post(
@@ -575,6 +585,9 @@ class TestInitFileUpload(BaseFileBrowserAPITest):
         payload = mock_nats_cmd.call_args[0][0]["payload"]
         self.assertEqual(payload["conflict_policy"], FileTransferConflictPolicy.SKIP)
         self.assertEqual(payload["destination_path"], r"C:\Users\Public\demo.txt")
+        log = AuditLog.objects.get(action=AuditActionType.FILE_TRANSFER)
+        self.assertEqual(log.after_value["operation"], "upload")
+        self.assertEqual(log.after_value["paths"], [r"C:\Users\Public\demo.txt"])
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_init_file_upload_agent_error_marks_failed(self, mock_nats_cmd) -> None:
@@ -722,6 +735,9 @@ class TestInitFileDownload(BaseFileBrowserAPITest):
         self.assertEqual(
             mock_nats_cmd.call_args[0][0]["func"], "files_download_prepare"
         )
+        log = AuditLog.objects.get(action=AuditActionType.FILE_TRANSFER)
+        self.assertEqual(log.after_value["operation"], "download")
+        self.assertEqual(log.after_value["paths"], [r"C:\Users\Public\readme.txt"])
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_init_file_download_empty_file(self, mock_nats_cmd) -> None:
@@ -787,6 +803,9 @@ class TestInitFileDownloadArchive(BaseFileBrowserAPITest):
             mock_nats_cmd.call_args[0][0]["func"],
             "files_download_archive_prepare",
         )
+        log = AuditLog.objects.get(action=AuditActionType.FILE_TRANSFER)
+        self.assertEqual(log.after_value["operation"], "archive_download")
+        self.assertEqual(len(log.after_value["paths"]), 2)
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_init_archive_allows_apostrophe_in_paths(self, mock_nats_cmd) -> None:

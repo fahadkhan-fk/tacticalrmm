@@ -1,4 +1,5 @@
 import datetime as dt
+import logging
 from time import sleep
 from typing import TYPE_CHECKING, Optional
 
@@ -23,6 +24,8 @@ from tacticalrmm.constants import (
 )
 from tacticalrmm.helpers import rand_range
 from tacticalrmm.utils import redis_lock
+
+logger = logging.getLogger("trmm.file_transfer")
 
 if TYPE_CHECKING:
     from django.db.models.query import QuerySet
@@ -319,6 +322,13 @@ def cleanup_expired_file_transfers_task() -> str:
         session.status = FileTransferStatus.EXPIRED
         session.error_message = session.error_message or "Session expired"
         session.save(update_fields=["status", "error_message", "updated_at"])
+        logger.error(
+            "file_transfer session=%s operation=%s status=%s: %s",
+            session.session_id,
+            session.operation,
+            session.status,
+            session.error_message,
+        )
         expired_count += 1
 
     retention_cutoff = now - dt.timedelta(hours=FILE_TRANSFER_SESSION_RETENTION_HOURS)

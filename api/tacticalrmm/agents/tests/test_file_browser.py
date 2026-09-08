@@ -14,6 +14,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_MAX_PAGE_SIZE,
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
+    FILE_TRANSFER_PIPELINE_DEPTH,
     AuditActionType,
     FileTransferConflictPolicy,
     FileTransferOperation,
@@ -984,3 +985,96 @@ class TestListFileTransfers(BaseFileBrowserAPITest):
         self.assertNotIn("conflict_policy", by_id[str(download.session_id)])
 
         self.check_not_authenticated("get", self.url)
+
+
+class TestUploadFileChunk(BaseFileBrowserAPITest):
+    def _chunk_url(self, session_id):
+        return self._session_url("upload_file_chunk", session_id)
+
+    @patch("agents.views.get_accepted_offset", return_value=512)
+    @patch("agents.views.get_upload_ack", return_value=512)
+    def test_upload_chunk_replay_already_accepted_is_idempotent(
+        self, _ack, _accepted
+    ) -> None:
+        """A retried put for an already accepted chunk must not fail the session."""
+        session = self._make_transfer_session(
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=512,
+            total_size=1024,
+            chunk_size=512,
+        )
+        response = self.client.put(
+            self._chunk_url(session.session_id),
+            data=b"x" * 512,
+            content_type="application/octet-stream",
+            HTTP_CONTENT_RANGE="bytes 0-511/1024",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["accepted_offset"], 512)
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+    @patch("agents.views.wait_for_upload_ack", return_value=None)
+    @patch("agents.views.get_accepted_offset")
+    @patch("agents.views.get_upload_ack", return_value=0)
+    def test_upload_chunk_depth_timeout_does_not_fail_session(
+        self, _ack, mock_accepted, _wait
+    ) -> None:
+        """Depth wait timeout is retryable, the session stays transferring."""
+        chunk = FILE_TRANSFER_CHUNK_SIZE
+        start = (FILE_TRANSFER_PIPELINE_DEPTH + 1) * chunk
+        total = start + chunk
+        mock_accepted.return_value = start
+        session = self._make_transfer_session(
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=total,
+            chunk_size=chunk,
+        )
+        response = self.client.put(
+            self._chunk_url(session.session_id),
+            data=b"x" * chunk,
+            content_type="application/octet-stream",
+            HTTP_CONTENT_RANGE=f"bytes {start}-{start + chunk - 1}/{total}",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "Timed out waiting for agent to commit previous chunk",
+            response.json(),
+        )
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+
+class TestCompleteFileUpload(BaseFileBrowserAPITest):
+    def test_complete_upload_already_completed_is_idempotent(self) -> None:
+        """A retried complete after success must not 400."""
+        session = self._make_transfer_session(
+            status=FileTransferStatus.COMPLETED,
+            committed_offset=1024,
+            total_size=1024,
+        )
+        url = self._session_url("complete_file_upload", session.session_id)
+        response = self.client.post(url, {"sha256": "abc"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], FileTransferStatus.COMPLETED)
+        self.assertEqual(response.json()["sha256"], "abc")
+
+    @patch("agents.views.wait_for_upload_ack", return_value=None)
+    @patch("agents.views.get_upload_ack", return_value=0)
+    def test_complete_upload_timeout_does_not_fail_session(self, _ack, _wait) -> None:
+        """Final chunk wait timeout is retryable, the session stays transferring."""
+        session = self._make_transfer_session(
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=1024,
+        )
+        url = self._session_url("complete_file_upload", session.session_id)
+        response = self.client.post(url, {"sha256": "abc"}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(
+            "Timed out waiting for agent to commit final chunk",
+            response.json(),
+        )
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)

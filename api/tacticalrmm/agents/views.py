@@ -2361,6 +2361,19 @@ class UploadFileChunk(APIView):
         redis_accepted = get_accepted_offset(session.session_id)
         accepted = max(redis_accepted or 0, committed)
 
+        if start < accepted:
+            return Response(
+                {
+                    "session_id": str(session.session_id),
+                    "status": session.status,
+                    "accepted_offset": accepted,
+                    "committed_offset": committed,
+                    "chunk_start": start,
+                    "chunk_end": end,
+                    "chunk_bytes": expected_len,
+                }
+            )
+
         if start != accepted:
             return notify_error(
                 f"Chunk start offset {start} does not match expected {accepted}"
@@ -2382,12 +2395,9 @@ class UploadFileChunk(APIView):
                 if session.status == FileTransferStatus.FAILED:
                     clear_upload_session_redis(session.session_id)
                     return notify_error(session.error_message or "Upload failed")
-                session.status = FileTransferStatus.FAILED
-                session.error_message = (
+                return notify_error(
                     "Timed out waiting for agent to commit previous chunk"
                 )
-                session.save(update_fields=["status", "error_message", "updated_at"])
-                return notify_error(session.error_message)
             committed = new_committed
 
         receive_t0 = time.monotonic()
@@ -2465,6 +2475,18 @@ class CompleteFileUpload(APIView):
             session.save(update_fields=["status", "updated_at"])
             return notify_error("Upload session has expired")
 
+        if session.status == FileTransferStatus.COMPLETED:
+            client_sha256 = (request.data.get("sha256") or "").strip().lower()
+            return Response(
+                {
+                    "session_id": str(session.session_id),
+                    "status": session.status,
+                    "destination_path": session.destination_path,
+                    "committed_offset": session.committed_offset,
+                    "sha256": client_sha256,
+                }
+            )
+
         if session.status not in (
             FileTransferStatus.AGENT_READY,
             FileTransferStatus.TRANSFERRING,
@@ -2481,12 +2503,10 @@ class CompleteFileUpload(APIView):
                 timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
             )
             if new_committed is None or new_committed < session.total_size:
-                session.status = FileTransferStatus.FAILED
-                session.error_message = (
-                    "Timed out waiting for agent to commit final chunk"
-                )
-                session.save(update_fields=["status", "error_message", "updated_at"])
-                return notify_error(session.error_message)
+                session.refresh_from_db(fields=["status", "error_message"])
+                if session.status == FileTransferStatus.FAILED:
+                    return notify_error(session.error_message or "Upload failed")
+                return notify_error("Timed out waiting for agent to commit final chunk")
             committed_offset = new_committed
 
         if session.committed_offset != committed_offset:

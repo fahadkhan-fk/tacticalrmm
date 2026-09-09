@@ -46,7 +46,6 @@ from tacticalrmm.constants import (
     AGENT_STATUS_ONLINE,
     AGENT_WINDOWS_SHELL_TOKENS,
     FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
-    FILE_TRANSFER_ACK_WAIT_SECONDS,
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_CHUNK_SIZE_MAX,
     FILE_TRANSFER_CHUNK_SIZE_MIN,
@@ -80,7 +79,7 @@ from tacticalrmm.constants import (
     PAAction,
     PAStatus,
 )
-from tacticalrmm.helpers import date_is_in_past, notify_error
+from tacticalrmm.helpers import date_is_in_past, notify_error, notify_retryable
 from tacticalrmm.permissions import (
     _has_perm_on_agent,
     _has_perm_on_client,
@@ -144,9 +143,6 @@ from .file_transfer_relay import (
     rollback_upload_chunk,
     signal_download_ack,
     store_upload_chunk,
-    wait_for_download_ack,
-    wait_for_download_chunk,
-    wait_for_upload_ack,
 )
 from .utils import (
     get_validated_agent,
@@ -2381,25 +2377,17 @@ class UploadFileChunk(APIView):
             )
 
         depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
-        depth_wait_ms = 0.0
         if start - committed > depth_bytes:
-            min_committed = start - depth_bytes
-            depth_wait_t0 = time.monotonic()
-            new_committed = wait_for_upload_ack(
-                session.session_id,
-                min_committed,
-                timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
-            )
-            depth_wait_ms = (time.monotonic() - depth_wait_t0) * 1000
-            if new_committed is None:
+            redis_committed = get_upload_ack(session.session_id)
+            committed = max(committed, redis_committed or 0)
+            if start - committed > depth_bytes:
                 session.refresh_from_db(fields=["status", "error_message"])
                 if session.status == FileTransferStatus.FAILED:
                     clear_upload_session_redis(session.session_id)
                     return notify_error(session.error_message or "Upload failed")
-                return notify_error(
+                return notify_retryable(
                     "Timed out waiting for agent to commit previous chunk"
                 )
-            committed = new_committed
 
         receive_t0 = time.monotonic()
         store_err = store_upload_chunk(session.session_id, start, end, chunk_data)
@@ -2433,13 +2421,12 @@ class UploadFileChunk(APIView):
         accepted_offset = end + 1
         logger.info(
             "file_transfer upload chunk accepted session=%s start=%s end=%s "
-            "chunk_receive_ms=%.1f chunk_notify_ms=%.1f depth_wait_ms=%.1f",
+            "chunk_receive_ms=%.1f chunk_notify_ms=%.1f",
             session.session_id,
             start,
             end,
             chunk_receive_ms,
             chunk_notify_ms,
-            depth_wait_ms,
         )
 
         return Response(
@@ -2498,17 +2485,15 @@ class CompleteFileUpload(APIView):
         committed_offset = max(session.committed_offset, redis_committed or 0)
 
         if committed_offset < session.total_size:
-            new_committed = wait_for_upload_ack(
-                session.session_id,
-                session.total_size,
-                timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
-            )
-            if new_committed is None or new_committed < session.total_size:
+            redis_committed = get_upload_ack(session.session_id)
+            committed_offset = max(committed_offset, redis_committed or 0)
+            if committed_offset < session.total_size:
                 session.refresh_from_db(fields=["status", "error_message"])
                 if session.status == FileTransferStatus.FAILED:
                     return notify_error(session.error_message or "Upload failed")
-                return notify_error("Timed out waiting for agent to commit final chunk")
-            committed_offset = new_committed
+                return notify_retryable(
+                    "Timed out waiting for agent to commit final chunk"
+                )
 
         if session.committed_offset != committed_offset:
             session.committed_offset = committed_offset
@@ -2942,30 +2927,22 @@ class GetFileDownloadChunk(APIView):
             session.committed_offset, redis_committed or 0, client_committed
         )
 
-        wait_t0 = time.monotonic()
-        offered = wait_for_download_chunk(
-            session.session_id,
-            committed,
-            timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
-        )
-        wait_ms = (time.monotonic() - wait_t0) * 1000
-
-        if offered is None:
+        offered = get_download_offered_offset(session.session_id)
+        if offered is None or offered <= committed:
             session.refresh_from_db(fields=["status", "error_message"])
             if session.status == FileTransferStatus.FAILED:
                 return notify_error(session.error_message or "Download failed")
-            return notify_error("Timed out waiting for agent to push chunk")
+            return notify_retryable("Timed out waiting for agent to push chunk")
 
         chunk = peek_download_chunk(session.session_id, committed)
         if chunk is None:
-            return notify_error("Chunk vanished from relay buffer")
+            return notify_retryable("Timed out waiting for agent to push chunk")
 
         logger.info(
-            "file_transfer download chunk served session=%s start=%s end=%s wait_ms=%.1f",
+            "file_transfer download chunk served session=%s start=%s end=%s",
             session.session_id,
             chunk.start,
             chunk.end,
-            wait_ms,
         )
 
         response = HttpResponse(chunk.data, content_type="application/octet-stream")
@@ -3050,6 +3027,21 @@ class AckFileDownloadChunk(APIView):
 
         signal_download_ack(session.session_id, committed_offset)
 
+        notify_err = send_nats_notification(
+            agent,
+            "files_download_ack",
+            {
+                "session_id": str(session.session_id),
+                "committed_offset": str(committed_offset),
+            },
+        )
+        if notify_err is not None:
+            logger.warning(
+                "file_transfer download ack nats notify failed session=%s: %s",
+                session.session_id,
+                notify_err.data,
+            )
+
         return Response({"committed_offset": committed_offset})
 
 
@@ -3084,17 +3076,10 @@ class CompleteFileDownload(APIView):
         committed_offset = max(session.committed_offset, redis_committed or 0)
 
         if committed_offset < session.total_size:
-            new_committed = wait_for_download_ack(
-                session.session_id,
-                session.total_size,
-                timeout=float(FILE_TRANSFER_ACK_WAIT_SECONDS),
-            )
-            if new_committed is None or new_committed < session.total_size:
-                session.status = FileTransferStatus.FAILED
-                session.error_message = "Timed out waiting for client to ACK all chunks"
-                session.save(update_fields=["status", "error_message", "updated_at"])
-                return notify_error(session.error_message)
-            committed_offset = new_committed
+            session.refresh_from_db(fields=["status", "error_message"])
+            if session.status == FileTransferStatus.FAILED:
+                return notify_error(session.error_message or "Download failed")
+            return notify_retryable("Timed out waiting for client to ACK all chunks")
 
         if session.committed_offset != committed_offset:
             session.committed_offset = committed_offset

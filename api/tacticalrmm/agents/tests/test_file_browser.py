@@ -1028,11 +1028,10 @@ class TestUploadFileChunk(BaseFileBrowserAPITest):
         session.refresh_from_db()
         self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
 
-    @patch("agents.views.wait_for_upload_ack", return_value=None)
     @patch("agents.views.get_accepted_offset")
     @patch("agents.views.get_upload_ack", return_value=0)
     def test_upload_chunk_depth_timeout_does_not_fail_session(
-        self, _ack, mock_accepted, _wait
+        self, _ack, mock_accepted
     ) -> None:
         """Depth wait timeout is retryable, the session stays transferring."""
         chunk = FILE_TRANSFER_CHUNK_SIZE
@@ -1051,7 +1050,7 @@ class TestUploadFileChunk(BaseFileBrowserAPITest):
             content_type="application/octet-stream",
             HTTP_CONTENT_RANGE=f"bytes {start}-{start + chunk - 1}/{total}",
         )
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 408)
         self.assertIn(
             "Timed out waiting for agent to commit previous chunk",
             response.json(),
@@ -1074,9 +1073,8 @@ class TestCompleteFileUpload(BaseFileBrowserAPITest):
         self.assertEqual(response.json()["status"], FileTransferStatus.COMPLETED)
         self.assertEqual(response.json()["sha256"], "abc")
 
-    @patch("agents.views.wait_for_upload_ack", return_value=None)
     @patch("agents.views.get_upload_ack", return_value=0)
-    def test_complete_upload_timeout_does_not_fail_session(self, _ack, _wait) -> None:
+    def test_complete_upload_timeout_does_not_fail_session(self, _ack) -> None:
         """Final chunk wait timeout is retryable, the session stays transferring."""
         session = self._make_transfer_session(
             status=FileTransferStatus.TRANSFERRING,
@@ -1085,10 +1083,114 @@ class TestCompleteFileUpload(BaseFileBrowserAPITest):
         )
         url = self._session_url("complete_file_upload", session.session_id)
         response = self.client.post(url, {"sha256": "abc"}, format="json")
-        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.status_code, 408)
         self.assertIn(
             "Timed out waiting for agent to commit final chunk",
             response.json(),
         )
         session.refresh_from_db()
         self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+
+class TestGetFileDownloadChunk(BaseFileBrowserAPITest):
+    def _chunk_url(self, session_id):
+        return self._session_url("get_file_download_chunk", session_id)
+
+    @patch("agents.views.get_download_offered_offset", return_value=None)
+    @patch("agents.views.get_download_ack", return_value=0)
+    def test_download_chunk_not_ready_does_not_fail_session(
+        self, _ack, _offered
+    ) -> None:
+        """A missing relay chunk is retryable and must not pin or fail the session."""
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            status=FileTransferStatus.TRANSFERRING,
+        )
+        response = self.client.get(self._chunk_url(session.session_id))
+        self.assertEqual(response.status_code, 408)
+        self.assertIn("Timed out waiting for agent to push chunk", response.json())
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+
+class TestCompleteFileDownload(BaseFileBrowserAPITest):
+    @patch("agents.views.get_download_ack", return_value=0)
+    def test_complete_download_timeout_does_not_fail_session(self, _ack) -> None:
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=1024,
+        )
+        url = self._session_url("complete_file_download", session.session_id)
+        response = self.client.post(url, {}, format="json")
+        self.assertEqual(response.status_code, 408)
+        self.assertIn("Timed out waiting for client to ACK all chunks", response.json())
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+
+class TestAgentDownloadPutChunk(BaseFileBrowserAPITest):
+    def setUp(self) -> None:
+        super().setUp()
+        self.authenticate_agent(self.agent)
+
+    @patch("apiv3.file_transfer_views.get_download_offered_offset")
+    @patch("apiv3.file_transfer_views.get_download_ack", return_value=0)
+    def test_depth_not_ready_does_not_fail_session(self, _ack, mock_offered) -> None:
+        """Agent depth check must 408 without failing the session or blocking a worker."""
+        chunk = FILE_TRANSFER_CHUNK_SIZE
+        start = FILE_TRANSFER_PIPELINE_DEPTH * chunk
+        total = start + chunk
+        mock_offered.return_value = start
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=total,
+            chunk_size=chunk,
+        )
+        url = reverse("file_transfer_download_put_chunk", args=[session.session_id])
+        response = self.client.put(
+            url,
+            data=b"x" * chunk,
+            content_type="application/octet-stream",
+            HTTP_CONTENT_RANGE=f"bytes {start}-{start + chunk - 1}/{total}",
+        )
+        self.assertEqual(response.status_code, 408)
+        self.assertIn(
+            "Timed out waiting for client to ACK previous chunk",
+            response.json(),
+        )
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+    @patch("apiv3.file_transfer_views.get_download_offered_offset")
+    @patch("apiv3.file_transfer_views.get_download_ack", return_value=0)
+    def test_download_chunk_ready_get_reports_can_put(self, _ack, mock_offered) -> None:
+        chunk = FILE_TRANSFER_CHUNK_SIZE
+        total = (FILE_TRANSFER_PIPELINE_DEPTH + 1) * chunk
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=total,
+            chunk_size=chunk,
+        )
+        url = reverse("file_transfer_download_put_chunk", args=[session.session_id])
+
+        mock_offered.return_value = 0
+        open_resp = self.client.get(url)
+        self.assertEqual(open_resp.status_code, 200)
+        self.assertTrue(open_resp.json()["can_put"])
+        self.assertEqual(open_resp.json()["offered_offset"], 0)
+        self.assertEqual(open_resp.json()["committed_offset"], 0)
+
+        mock_offered.return_value = FILE_TRANSFER_PIPELINE_DEPTH * chunk
+        full_resp = self.client.get(url)
+        self.assertEqual(full_resp.status_code, 200)
+        self.assertFalse(full_resp.json()["can_put"])
+        self.assertEqual(
+            full_resp.json()["offered_offset"],
+            FILE_TRANSFER_PIPELINE_DEPTH * chunk,
+        )

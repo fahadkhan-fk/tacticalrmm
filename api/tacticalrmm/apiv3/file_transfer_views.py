@@ -1,7 +1,6 @@
 import datetime as dt
 import json
 import logging
-import time
 
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
@@ -22,20 +21,18 @@ from agents.file_transfer_relay import (
     pop_upload_chunk,
     signal_upload_ack,
     store_download_chunk,
-    wait_for_download_ack,
 )
 from agents.models import FileTransferSession
 from agents.utils import parse_upload_content_range
 from tacticalrmm.constants import (
     FILE_TRANSFER_ACK_CHECKPOINT_BYTES,
     FILE_TRANSFER_CHUNK_SIZE_MAX,
-    FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS,
     FILE_TRANSFER_PIPELINE_DEPTH,
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FileTransferOperation,
     FileTransferStatus,
 )
-from tacticalrmm.helpers import notify_error
+from tacticalrmm.helpers import notify_error, notify_retryable
 
 logger = logging.getLogger("trmm.file_transfer")
 
@@ -177,9 +174,81 @@ class FileTransferAck(APIView):
         return Response({"committed_offset": committed_offset})
 
 
+def download_relay_put_state(session):
+    """Return committed, offered, can_put from Redis + the session row."""
+    redis_committed = get_download_ack(session.session_id)
+    committed = max(session.committed_offset, redis_committed or 0)
+    redis_offered = get_download_offered_offset(session.session_id)
+    offered = max(redis_offered or 0, committed)
+    depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
+    can_put = (
+        session.status
+        in (
+            FileTransferStatus.AGENT_READY,
+            FileTransferStatus.TRANSFERRING,
+        )
+        and offered < session.total_size
+        and (offered - committed) < depth_bytes
+    )
+    return committed, offered, can_put
+
+
 class FileTransferDownloadPutChunk(APIView):
     authentication_classes = [TokenAuthentication]
     permission_classes = [IsAuthenticated]
+
+    def get(self, request, session_id):
+        agent = getattr(request.user, "agent", None)
+        if agent is None:
+            return Response(
+                "Invalid agent credentials",
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        session = get_object_or_404(
+            FileTransferSession,
+            session_id=session_id,
+            agent=agent,
+            operation=FileTransferOperation.DOWNLOAD,
+        )
+
+        if session.expires_at <= djangotime.now():
+            session.status = FileTransferStatus.EXPIRED
+            session.save(update_fields=["status", "updated_at"])
+            return notify_error("Download session has expired")
+
+        if session.status in _TERMINAL_STATUSES:
+            committed, offered, _can_put = download_relay_put_state(session)
+            return Response(
+                {
+                    "session_id": str(session.session_id),
+                    "status": session.status,
+                    "committed_offset": committed,
+                    "offered_offset": offered,
+                    "chunk_size": session.chunk_size,
+                    "total_size": session.total_size,
+                    "can_put": False,
+                }
+            )
+
+        if session.status not in (
+            FileTransferStatus.AGENT_READY,
+            FileTransferStatus.TRANSFERRING,
+        ):
+            return notify_error("Download session is not ready for chunk transfer")
+
+        committed, offered, can_put = download_relay_put_state(session)
+        return Response(
+            {
+                "session_id": str(session.session_id),
+                "status": session.status,
+                "committed_offset": committed,
+                "offered_offset": offered,
+                "chunk_size": session.chunk_size,
+                "total_size": session.total_size,
+                "can_put": can_put,
+            }
+        )
 
     def put(self, request, session_id):
         agent = getattr(request.user, "agent", None)
@@ -233,43 +302,24 @@ class FileTransferDownloadPutChunk(APIView):
         if expected_len > FILE_TRANSFER_CHUNK_SIZE_MAX:
             return notify_error("Chunk exceeds maximum request size")
 
-        chunk_data = request.body
-        if len(chunk_data) != expected_len:
-            return notify_error("Request body size does not match Content-Range")
-
-        redis_committed = get_download_ack(session.session_id)
-        committed = max(session.committed_offset, redis_committed or 0)
-
-        redis_offered = get_download_offered_offset(session.session_id)
-        offered = max(redis_offered or 0, committed)
-
+        committed, offered, can_put = download_relay_put_state(session)
         if start != offered:
             return notify_error(
                 f"Chunk start offset {start} does not match expected {offered}"
             )
 
-        depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
-        depth_wait_ms = 0.0
-        if start - committed >= depth_bytes:
-            min_committed = start - depth_bytes + session.chunk_size
-            depth_wait_t0 = time.monotonic()
-            new_committed = wait_for_download_ack(
-                session.session_id,
-                min_committed,
-                timeout=float(FILE_TRANSFER_DL_DEPTH_WAIT_SECONDS),
+        if not can_put:
+            session.refresh_from_db(fields=["status", "error_message"])
+            if session.status == FileTransferStatus.FAILED:
+                return notify_error(session.error_message or "Download failed")
+            _ = request.body
+            return notify_retryable(
+                "Timed out waiting for client to ACK previous chunk"
             )
-            depth_wait_ms = (time.monotonic() - depth_wait_t0) * 1000
-            if new_committed is None:
-                session.refresh_from_db(fields=["status", "error_message"])
-                if session.status == FileTransferStatus.FAILED:
-                    return notify_error(session.error_message or "Download failed")
-                session.status = FileTransferStatus.FAILED
-                session.error_message = (
-                    "Timed out waiting for client to ACK previous chunk"
-                )
-                session.save(update_fields=["status", "error_message", "updated_at"])
-                return notify_error(session.error_message)
-            committed = new_committed
+
+        chunk_data = request.body
+        if len(chunk_data) != expected_len:
+            return notify_error("Request body size does not match Content-Range")
 
         store_err = store_download_chunk(session.session_id, start, end, chunk_data)
         if store_err:
@@ -280,12 +330,10 @@ class FileTransferDownloadPutChunk(APIView):
             session.save(update_fields=["status", "updated_at"])
 
         logger.info(
-            "file_transfer download chunk stored session=%s start=%s end=%s "
-            "depth_wait_ms=%.1f",
+            "file_transfer download chunk stored session=%s start=%s end=%s",
             session.session_id,
             start,
             end,
-            depth_wait_ms,
         )
 
         return Response(

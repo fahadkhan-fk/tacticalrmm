@@ -39,6 +39,11 @@ def notify_error(msg: str) -> Response:
     return Response(msg, status=status.HTTP_400_BAD_REQUEST)
 
 
+def notify_retryable(msg: str) -> Response:
+    """408: the same request can be retried. Do not fail the transfer session."""
+    return Response(msg, status=status.HTTP_408_REQUEST_TIMEOUT)
+
+
 def get_nats_ports() -> tuple[int, int]:
     """
     Returns: tuple[nats_standard_port: int, nats_websocket_port: int]

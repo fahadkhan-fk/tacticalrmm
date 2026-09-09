@@ -206,10 +206,8 @@ def wait_for_upload_ack(
 ) -> Optional[int]:
     """Block until committed_offset >= min_offset, or until timeout.
 
-    Used for two purposes:
-      - Depth-1 prefetch: wait for committed to advance before accepting
-        the next-next chunk (min_offset = next_start - chunk_size).
-      - Complete: wait for final commit (min_offset = total_size).
+    HTTP request handlers must not call this. They peek Redis and return 408
+    so a uWSGI worker is not pinned for ACK_WAIT seconds.
     """
     if timeout is None:
         timeout = float(FILE_TRANSFER_ACK_WAIT_SECONDS)

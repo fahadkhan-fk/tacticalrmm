@@ -11,6 +11,7 @@ from agents.models import Agent, FileTransferSession
 from logs.models import AuditLog
 from tacticalrmm.constants import (
     FILE_BROWSER_DEFAULT_PAGE_SIZE,
+    FILE_BROWSER_MAX_PAGE,
     FILE_BROWSER_MAX_PAGE_SIZE,
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
@@ -188,6 +189,19 @@ class TestListFiles(BaseFileBrowserAPITest):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("page_size must be between 1 and", response.json())
+
+    def test_list_files_invalid_page(self) -> None:
+        """Should reject page values that can overflow agent pagination math."""
+        response = self.client.get(
+            self.url,
+            {
+                "path": r"C:\Users\Public",
+                "page": FILE_BROWSER_MAX_PAGE + 1,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("page must be between 1 and", response.json())
 
     def test_list_files_invalid_filter_chars(self) -> None:
         """Should reject filters containing control characters."""

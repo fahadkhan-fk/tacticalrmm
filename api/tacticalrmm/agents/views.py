@@ -55,6 +55,7 @@ from tacticalrmm.constants import (
     FILE_TRANSFER_MAX_SESSIONS_PER_USER,
     FILE_TRANSFER_SESSION_TTL_HOURS,
     FILE_BROWSER_DEFAULT_PAGE_SIZE,
+    FILE_BROWSER_MAX_PAGE,
     FILE_BROWSER_MAX_PAGE_SIZE,
     FILE_BROWSER_MAX_UPLOAD_FILE_SIZE_BYTES,
     FILE_BROWSER_MAX_ARCHIVE_PATHS,
@@ -1862,8 +1863,8 @@ class ListFiles(APIView):
         except ValueError:
             return notify_error("page and page_size must be integers")
 
-        if page < 1:
-            return notify_error("page must be >= 1")
+        if page < 1 or page > FILE_BROWSER_MAX_PAGE:
+            return notify_error(f"page must be between 1 and {FILE_BROWSER_MAX_PAGE}")
         if page_size < 1 or page_size > FILE_BROWSER_MAX_PAGE_SIZE:
             return notify_error(
                 f"page_size must be between 1 and {FILE_BROWSER_MAX_PAGE_SIZE}"

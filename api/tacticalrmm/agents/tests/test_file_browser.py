@@ -1194,3 +1194,54 @@ class TestAgentDownloadPutChunk(BaseFileBrowserAPITest):
             full_resp.json()["offered_offset"],
             FILE_TRANSFER_PIPELINE_DEPTH * chunk,
         )
+
+
+class TestFileBrowserPermissions(BaseFileBrowserAPITest):
+    def test_new_role_file_browser_defaults_false(self) -> None:
+        role = baker.make("accounts.Role")
+        self.assertFalse(role.can_use_file_browser)
+
+    def test_mesh_permission_does_not_grant_file_browser(self) -> None:
+        defaults_url = reverse("file_browser_defaults", args=[self.agent.agent_id])
+        list_url = reverse("list_files", args=[self.agent.agent_id])
+        user = self.create_user_with_roles(["can_use_mesh"])
+        self.client.force_authenticate(user=user)
+
+        self.check_not_authorized("get", defaults_url)
+        self.check_not_authorized("get", list_url)
+
+    def test_file_browser_permission_allows_defaults(self) -> None:
+        url = reverse("file_browser_defaults", args=[self.agent.agent_id])
+        user = self.create_user_with_roles(["can_use_file_browser"])
+        self.client.force_authenticate(user=user)
+
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn("file_browser_mode", response.json())
+
+    def test_copy_mesh_permission_to_file_browser(self) -> None:
+        import importlib
+
+        from django.apps import apps
+
+        mesh = baker.make(
+            "accounts.Role", can_use_mesh=True, can_use_file_browser=False
+        )
+        other = baker.make(
+            "accounts.Role", can_use_mesh=False, can_use_file_browser=False
+        )
+        already = baker.make(
+            "accounts.Role", can_use_mesh=True, can_use_file_browser=True
+        )
+
+        migration = importlib.import_module(
+            "accounts.migrations.0044_copy_mesh_permission_to_file_browser"
+        )
+        migration.copy_can_use_mesh_to_file_browser(apps, None)
+
+        mesh.refresh_from_db()
+        other.refresh_from_db()
+        already.refresh_from_db()
+        self.assertTrue(mesh.can_use_file_browser)
+        self.assertFalse(other.can_use_file_browser)
+        self.assertTrue(already.can_use_file_browser)

@@ -32,7 +32,12 @@ class BaseFileBrowserAPITest(TacticalTestCase):
     def setUp(self) -> None:
         self.authenticate()
         self.setup_coresettings()
-        self.agent = baker.make(Agent, version="2.10.0", plat="windows")
+        self.agent = baker.make(
+            Agent,
+            version="2.10.0",
+            plat="windows",
+            agent_id="filebrowser-test-agent-id-0001",
+        )
         if self.api_name:
             self.url = reverse(self.api_name, args=[self.agent.agent_id])
 
@@ -659,6 +664,51 @@ class TestInitFileUpload(BaseFileBrowserAPITest):
         self.assertTrue(response.json().get("resumed"))
         self.assertEqual(response.json()["committed_offset"], 512)
 
+    def test_init_file_upload_invalid_session_id_returns_400(self) -> None:
+        """Malformed resume session_id must be 400."""
+        response = self.client.post(
+            self.url,
+            self._upload_payload(session_id="not-a-uuid"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("session_id", response.json())
+
+    def test_init_file_upload_non_string_filename_does_not_500(self) -> None:
+        """Json numbers must not attribute error on .strip()."""
+        with patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock) as mock_nats:
+            mock_nats.return_value = {"status": "ready", "committed_offset": 0}
+            response = self.client.post(
+                self.url,
+                self._upload_payload(filename=123),
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        session = FileTransferSession.objects.get(
+            session_id=response.json()["session_id"]
+        )
+        self.assertEqual(session.filename, "123")
+
+    def test_init_file_upload_object_filename_returns_400(self) -> None:
+        """Structured json is rejected instead of crashing the worker."""
+        response = self.client.post(
+            self.url,
+            self._upload_payload(filename={"name": "demo.txt"}),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("filename", response.json())
+
+    def test_init_file_upload_invalid_chunk_size_returns_400(self) -> None:
+        """Non integer chunk_size must be 400."""
+        response = self.client.post(
+            self.url,
+            self._upload_payload(chunk_size="huge"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("chunk_size", response.json())
+
 
 class TestCancelFileUpload(BaseFileBrowserAPITest):
     @patch("agents.views.clear_upload_session_redis")
@@ -779,6 +829,40 @@ class TestInitFileDownload(BaseFileBrowserAPITest):
         )
         self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
 
+    def test_init_file_download_invalid_session_id_returns_400(self) -> None:
+        """Malformed resume session_id must be 400."""
+        response = self.client.post(
+            self.url,
+            {"session_id": "not-a-uuid", "source_path": r"C:\Users\Public\readme.txt"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("session_id", response.json())
+
+    def test_init_file_download_non_string_source_returns_400(self) -> None:
+        """Numeric source_path must not 500, path validation still rejects it."""
+        response = self.client.post(self.url, {"source_path": 123}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("source_path", response.json())
+
+    def test_init_file_download_invalid_resume_offset_returns_400(self) -> None:
+        """Resume offset that is not an integer must be 400."""
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            destination_path=r"C:\Users\Public\readme.txt",
+            filename="readme.txt",
+        )
+        response = self.client.post(
+            self.url,
+            {
+                "session_id": str(session.session_id),
+                "resume_offset": "halfway",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("resume_offset", response.json())
+
 
 class TestInitFileDownloadArchive(BaseFileBrowserAPITest):
     api_name = "init_file_download_archive"
@@ -847,6 +931,26 @@ class TestInitFileDownloadArchive(BaseFileBrowserAPITest):
         self.assertEqual(
             FileTransferSession.objects.get().status, FileTransferStatus.FAILED
         )
+
+    def test_init_archive_non_string_filename_does_not_500(self) -> None:
+        """Json numbers in filename must not attribute error on .strip()."""
+        with patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock) as mock_nats:
+            mock_nats.return_value = {"status": "building"}
+            response = self.client.post(
+                self.url,
+                {"paths": [r"C:\Users\Public\Docs"], "filename": 123},
+                format="json",
+            )
+        self.assertEqual(response.status_code, status.HTTP_202_ACCEPTED)
+        self.assertEqual(response.json()["filename"], "123.zip")
+
+    def test_init_archive_paths_not_a_list_returns_400(self) -> None:
+        """A string in paths must be 400."""
+        response = self.client.post(
+            self.url, {"paths": r"C:\Users\Public\Docs"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("paths", response.json())
 
 
 class TestCancelFileDownload(BaseFileBrowserAPITest):

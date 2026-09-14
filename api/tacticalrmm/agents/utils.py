@@ -371,7 +371,7 @@ def resolve_upload_destination_path(
 def derive_archive_download_filename(
     paths: list[str], requested: str | None = None
 ) -> str:
-    name = (requested or "").strip()
+    name = str(requested or "").strip()
     if name:
         if not name.lower().endswith(".zip"):
             name = f"{name}.zip"

@@ -79,7 +79,12 @@ from tacticalrmm.constants import (
     PAAction,
     PAStatus,
 )
-from tacticalrmm.helpers import date_is_in_past, notify_error, notify_retryable
+from tacticalrmm.helpers import (
+    date_is_in_past,
+    notify_error,
+    notify_retryable,
+    notify_serializer_error,
+)
 from tacticalrmm.permissions import (
     _has_perm_on_agent,
     _has_perm_on_client,
@@ -125,6 +130,9 @@ from .serializers import (
     AgentTableSerializer,
     AgentFileBrowserDefaultsSerializer,
     AgentTerminalDefaultsSerializer,
+    InitFileDownloadArchiveSerializer,
+    InitFileDownloadSerializer,
+    InitFileUploadSerializer,
 )
 from .tasks import (
     bulk_recover_agents_task,
@@ -1739,12 +1747,23 @@ def create_file_transfer_session_locked(agent, user, **fields):
 
 def _normalize_upload_conflict_policy(raw):
     """Return a valid conflict policy, or None when an invalid value."""
-    val = (raw or "").strip().lower()
+    if raw is None:
+        return FileTransferConflictPolicy.REPLACE
+    val = str(raw).strip().lower()
     if not val:
         return FileTransferConflictPolicy.REPLACE
     if val in FileTransferConflictPolicy.values:
         return val
     return None
+
+
+def _file_transfer_chunk_size(requested) -> int:
+    if requested is None:
+        return FILE_TRANSFER_CHUNK_SIZE
+    return max(
+        FILE_TRANSFER_CHUNK_SIZE_MIN,
+        min(int(requested), FILE_TRANSFER_CHUNK_SIZE_MAX),
+    )
 
 
 _FILE_TRANSFER_RESUMABLE_STATUSES = (
@@ -1754,10 +1773,10 @@ _FILE_TRANSFER_RESUMABLE_STATUSES = (
 )
 
 
-def _resume_file_upload(request, agent, session_id):
+def _resume_file_upload(request, agent, data):
     session = get_object_or_404(
         FileTransferSession,
-        session_id=session_id,
+        session_id=data["session_id"],
         agent=agent,
         user=request.user,
         operation=FileTransferOperation.UPLOAD,
@@ -1773,18 +1792,12 @@ def _resume_file_upload(request, agent, session_id):
             f"Upload session cannot be resumed (status: {session.status})"
         )
 
-    filename = (request.data.get("filename") or "").strip()
+    filename = (data.get("filename") or "").strip()
     if filename and filename != session.filename:
         return notify_error("filename does not match the session being resumed")
-    raw_total = request.data.get("total_size")
-    if raw_total is not None:
-        try:
-            if int(raw_total) != session.total_size:
-                return notify_error(
-                    "total_size does not match the session being resumed"
-                )
-        except (TypeError, ValueError):
-            return notify_error("total_size must be a positive integer")
+    raw_total = data.get("total_size")
+    if raw_total is not None and int(raw_total) != session.total_size:
+        return notify_error("total_size does not match the session being resumed")
 
     redis_committed = get_upload_ack(session.session_id)
     resume_offset = max(session.committed_offset, redis_committed or 0)
@@ -2133,12 +2146,16 @@ class InitFileUpload(APIView):
         if isinstance(agent, Response):
             return agent
 
-        resume_session_id = (request.data.get("session_id") or "").strip()
-        if resume_session_id:
-            return _resume_file_upload(request, agent, resume_session_id)
+        serializer = InitFileUploadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return notify_serializer_error(serializer)
+        data = serializer.validated_data
 
-        filename = (request.data.get("filename") or "").strip()
-        destination_path = (request.data.get("destination_path") or "").strip()
+        if data.get("session_id"):
+            return _resume_file_upload(request, agent, data)
+
+        filename = (data.get("filename") or "").strip()
+        destination_path = (data.get("destination_path") or "").strip()
 
         filename_err = validate_file_transfer_filename(filename)
         if filename_err:
@@ -2148,12 +2165,8 @@ class InitFileUpload(APIView):
         if path_err:
             return notify_error(path_err)
 
-        try:
-            total_size = int(request.data.get("total_size"))
-        except (TypeError, ValueError):
-            return notify_error("total_size must be a positive integer")
-
-        if total_size < 1:
+        total_size = data.get("total_size")
+        if total_size is None:
             return notify_error("total_size must be a positive integer")
 
         if (
@@ -2174,22 +2187,9 @@ class InitFileUpload(APIView):
         if path_err:
             return notify_error(path_err)
 
-        raw_chunk_size = request.data.get("chunk_size")
-        if raw_chunk_size is not None:
-            try:
-                requested_chunk_size = int(raw_chunk_size)
-            except (TypeError, ValueError):
-                return notify_error("chunk_size must be a positive integer")
-            chunk_size = max(
-                FILE_TRANSFER_CHUNK_SIZE_MIN,
-                min(requested_chunk_size, FILE_TRANSFER_CHUNK_SIZE_MAX),
-            )
-        else:
-            chunk_size = FILE_TRANSFER_CHUNK_SIZE
+        chunk_size = _file_transfer_chunk_size(data.get("chunk_size"))
 
-        conflict_policy = _normalize_upload_conflict_policy(
-            request.data.get("conflict_policy")
-        )
+        conflict_policy = _normalize_upload_conflict_policy(data.get("conflict_policy"))
         if conflict_policy is None:
             return notify_error("conflict_policy must be 'replace' or 'skip'")
 
@@ -2555,10 +2555,10 @@ class CompleteFileUpload(APIView):
         )
 
 
-def _resume_file_download(request, agent, session_id):
+def _resume_file_download(request, agent, data):
     session = get_object_or_404(
         FileTransferSession,
-        session_id=session_id,
+        session_id=data["session_id"],
         agent=agent,
         user=request.user,
         operation=FileTransferOperation.DOWNLOAD,
@@ -2580,10 +2580,9 @@ def _resume_file_download(request, agent, session_id):
     ):
         return notify_error("Archive is still being prepared; cannot resume yet")
 
-    try:
-        resume_offset = int(request.data.get("resume_offset", session.committed_offset))
-    except (TypeError, ValueError):
-        return notify_error("resume_offset must be a non-negative integer")
+    resume_offset = data.get("resume_offset")
+    if resume_offset is None:
+        resume_offset = session.committed_offset
 
     if resume_offset < 0 or resume_offset > session.total_size:
         return notify_error("resume_offset is out of range")
@@ -2653,27 +2652,20 @@ class InitFileDownload(APIView):
         if isinstance(agent, Response):
             return agent
 
-        resume_session_id = (request.data.get("session_id") or "").strip()
-        if resume_session_id:
-            return _resume_file_download(request, agent, resume_session_id)
+        serializer = InitFileDownloadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return notify_serializer_error(serializer)
+        data = serializer.validated_data
 
-        source_path = (request.data.get("source_path") or "").strip()
+        if data.get("session_id"):
+            return _resume_file_download(request, agent, data)
+
+        source_path = (data.get("source_path") or "").strip()
         path_err = validate_file_transfer_source_path(source_path, agent.plat)
         if path_err:
             return notify_error(path_err)
 
-        raw_chunk_size = request.data.get("chunk_size")
-        if raw_chunk_size is not None:
-            try:
-                requested_chunk_size = int(raw_chunk_size)
-            except (TypeError, ValueError):
-                return notify_error("chunk_size must be a positive integer")
-            chunk_size = max(
-                FILE_TRANSFER_CHUNK_SIZE_MIN,
-                min(requested_chunk_size, FILE_TRANSFER_CHUNK_SIZE_MAX),
-            )
-        else:
-            chunk_size = FILE_TRANSFER_CHUNK_SIZE
+        chunk_size = _file_transfer_chunk_size(data.get("chunk_size"))
 
         session = create_file_transfer_session_locked(
             agent,
@@ -2768,7 +2760,12 @@ class InitFileDownloadArchive(APIView):
         if isinstance(agent, Response):
             return agent
 
-        raw_paths = request.data.get("paths")
+        serializer = InitFileDownloadArchiveSerializer(data=request.data)
+        if not serializer.is_valid():
+            return notify_serializer_error(serializer)
+        data = serializer.validated_data
+
+        raw_paths = data.get("paths")
         validated_paths, paths_err = collect_file_transfer_paths(
             raw_paths,
             agent.plat,
@@ -2782,24 +2779,13 @@ class InitFileDownloadArchive(APIView):
         assert validated_paths is not None
 
         filename = derive_archive_download_filename(
-            validated_paths, request.data.get("filename")
+            validated_paths, data.get("filename")
         )
         filename_err = validate_file_transfer_filename(filename)
         if filename_err:
             return notify_error(filename_err)
 
-        raw_chunk_size = request.data.get("chunk_size")
-        if raw_chunk_size is not None:
-            try:
-                requested_chunk_size = int(raw_chunk_size)
-            except (TypeError, ValueError):
-                return notify_error("chunk_size must be a positive integer")
-            chunk_size = max(
-                FILE_TRANSFER_CHUNK_SIZE_MIN,
-                min(requested_chunk_size, FILE_TRANSFER_CHUNK_SIZE_MAX),
-            )
-        else:
-            chunk_size = FILE_TRANSFER_CHUNK_SIZE
+        chunk_size = _file_transfer_chunk_size(data.get("chunk_size"))
 
         session = create_file_transfer_session_locked(
             agent,

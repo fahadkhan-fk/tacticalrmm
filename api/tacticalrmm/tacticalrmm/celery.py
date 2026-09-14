@@ -51,7 +51,7 @@ app.conf.beat_schedule = {
     },
     "cleanup-expired-file-transfers": {
         "task": "agents.tasks.cleanup_expired_file_transfers_task",
-        "schedule": crontab(minute=20, hour="*"),
+        "schedule": crontab(minute="*/10"),
     },
     "cache-db-fields-task": {
         "task": "core.tasks.cache_db_fields_task",

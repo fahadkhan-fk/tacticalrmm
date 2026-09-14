@@ -15,6 +15,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_MAX_PAGE_SIZE,
     FILE_BROWSER_MIN_AGENT_VERSION,
     FILE_TRANSFER_CHUNK_SIZE,
+    FILE_TRANSFER_IDLE_EXPIRE_MINUTES,
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
     FILE_TRANSFER_PIPELINE_DEPTH,
     AuditActionType,
@@ -698,6 +699,21 @@ class TestInitFileUpload(BaseFileBrowserAPITest):
         self.assertEqual(response.status_code, 400)
         self.assertIn("session_id", response.json())
 
+    def test_init_file_upload_cannot_resume_other_users_session(self) -> None:
+        """Resume stays owner scoped so another user cannot take over the transfer."""
+        session = self._make_transfer_session(user=self.alice)
+        response = self.client.post(
+            self.url,
+            {
+                "session_id": str(session.session_id),
+                "filename": session.filename,
+                "total_size": session.total_size,
+                "destination_path": r"C:\Users\Public",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 404)
+
     def test_init_file_upload_non_string_filename_does_not_500(self) -> None:
         """Json numbers must not attribute error on .strip()."""
         with patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock) as mock_nats:
@@ -768,6 +784,13 @@ class TestCancelFileUpload(BaseFileBrowserAPITest):
     def test_cancel_file_upload_not_found(self) -> None:
         """Unknown session should 404."""
         url = self._session_url("cancel_file_upload", uuid4())
+        response = self.client.post(url, {}, format="json")
+        self.assertEqual(response.status_code, 404)
+
+    def test_cancel_other_users_upload_is_not_found(self) -> None:
+        """Cancel stays owner scoped; another user's session is not visible."""
+        session = self._make_transfer_session(user=self.alice)
+        url = self._session_url("cancel_file_upload", session.session_id)
         response = self.client.post(url, {}, format="json")
         self.assertEqual(response.status_code, 404)
 
@@ -1024,6 +1047,18 @@ class TestCancelFileDownload(BaseFileBrowserAPITest):
         self.assertEqual(session.status, FileTransferStatus.FAILED)
         self.assertIn("failure", session.error_message.lower())
 
+    def test_cancel_other_users_download_is_not_found(self) -> None:
+        """Cancel stays owner scoped; another user's download is not visible."""
+        session = self._make_transfer_session(
+            user=self.alice,
+            operation=FileTransferOperation.DOWNLOAD,
+            destination_path=r"C:\Users\Public\alice.txt",
+            filename="alice.txt",
+        )
+        url = self._session_url("cancel_file_download", session.session_id)
+        response = self.client.post(url, {}, format="json")
+        self.assertEqual(response.status_code, 404)
+
 
 class TestGetFileDownloadStatus(BaseFileBrowserAPITest):
     def test_get_file_download_status_success(self) -> None:
@@ -1067,6 +1102,18 @@ class TestGetFileDownloadStatus(BaseFileBrowserAPITest):
         self.assertEqual(response.json()["status"], FileTransferStatus.EXPIRED)
         session.refresh_from_db()
         self.assertEqual(session.status, FileTransferStatus.EXPIRED)
+
+    def test_get_file_download_status_other_user_is_not_found(self) -> None:
+        """Status stays owner scoped."""
+        session = self._make_transfer_session(
+            user=self.alice,
+            operation=FileTransferOperation.DOWNLOAD,
+            destination_path=r"C:\Users\Public\alice.txt",
+            filename="alice.txt",
+        )
+        url = self._session_url("get_file_download_status", session.session_id)
+        response = self.client.get(url, format="json")
+        self.assertEqual(response.status_code, 404)
 
 
 class TestListFileTransfers(BaseFileBrowserAPITest):
@@ -1411,3 +1458,95 @@ class TestFileBrowserPermissions(BaseFileBrowserAPITest):
         self.assertTrue(mesh.can_use_file_browser)
         self.assertFalse(other.can_use_file_browser)
         self.assertTrue(already.can_use_file_browser)
+
+
+class TestExpireStaleFileTransfers(BaseFileBrowserAPITest):
+    def _age_session(self, session: FileTransferSession, minutes: int) -> None:
+        FileTransferSession.objects.filter(pk=session.pk).update(
+            created_at=djangotime.now() - dt.timedelta(minutes=minutes)
+        )
+
+    @patch("agents.file_transfer_relay.clear_download_session_redis")
+    @patch("agents.file_transfer_relay.clear_upload_session_redis")
+    @patch("agents.file_transfer_relay.get_download_ack", return_value=None)
+    @patch("agents.file_transfer_relay.get_upload_ack", return_value=None)
+    def test_idle_never_started_session_expires(self, *_mocks) -> None:
+        from agents.tasks import expire_stale_file_transfer_sessions
+
+        session = self._make_transfer_session(committed_offset=0)
+        self._age_session(session, FILE_TRANSFER_IDLE_EXPIRE_MINUTES + 1)
+        expire_stale_file_transfer_sessions(notify_agent=False)
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.EXPIRED)
+        self.assertIn("10 minutes", session.error_message)
+
+    @patch("agents.file_transfer_relay.get_download_ack", return_value=None)
+    @patch("agents.file_transfer_relay.get_upload_ack", return_value=None)
+    def test_recent_never_started_session_stays_active(self, *_mocks) -> None:
+        from agents.tasks import expire_stale_file_transfer_sessions
+
+        session = self._make_transfer_session(committed_offset=0)
+        expire_stale_file_transfer_sessions(notify_agent=False)
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+    def test_progressed_session_is_not_idle_expired(self) -> None:
+        from agents.tasks import expire_stale_file_transfer_sessions
+
+        session = self._make_transfer_session(committed_offset=512)
+        self._age_session(session, FILE_TRANSFER_IDLE_EXPIRE_MINUTES + 1)
+        expire_stale_file_transfer_sessions(notify_agent=False)
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+    def test_archive_still_preparing_is_not_idle_expired(self) -> None:
+        from agents.tasks import expire_stale_file_transfer_sessions
+
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            status=FileTransferStatus.WAITING_FOR_AGENT,
+            is_archive=True,
+            committed_offset=0,
+            filename="Docs.zip",
+            destination_path=r"C:\Users\Public\Docs",
+        )
+        self._age_session(session, FILE_TRANSFER_IDLE_EXPIRE_MINUTES + 1)
+        expire_stale_file_transfer_sessions(notify_agent=False)
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.WAITING_FOR_AGENT)
+
+    @patch("agents.file_transfer_relay.clear_download_session_redis")
+    @patch("agents.file_transfer_relay.clear_upload_session_redis")
+    @patch("agents.file_transfer_relay.get_download_ack", return_value=None)
+    @patch("agents.file_transfer_relay.get_upload_ack", return_value=None)
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_idle_sessions_free_cap_on_next_init(self, mock_nats, *_acks) -> None:
+        """Abandoned never started sessions must not block a new init after 10 minutes."""
+        mock_nats.return_value = {"status": "ready", "committed_offset": 0}
+        for i in range(FILE_TRANSFER_MAX_SESSIONS_PER_AGENT):
+            session = self._make_transfer_session(
+                filename=f"stale-{i}.txt",
+                destination_path=rf"C:\Users\Public\stale-{i}.txt",
+                committed_offset=0,
+            )
+            self._age_session(session, FILE_TRANSFER_IDLE_EXPIRE_MINUTES + 1)
+
+        url = reverse("init_file_upload", args=[self.agent.agent_id])
+        response = self.client.post(
+            url,
+            {
+                "filename": "fresh.txt",
+                "destination_path": r"C:\Users\Public",
+                "total_size": 1024,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_cleanup_task_runs_every_ten_minutes(self) -> None:
+        from celery.schedules import crontab
+
+        from tacticalrmm.celery import app
+
+        schedule = app.conf.beat_schedule["cleanup-expired-file-transfers"]["schedule"]
+        self.assertEqual(schedule, crontab(minute="*/10"))

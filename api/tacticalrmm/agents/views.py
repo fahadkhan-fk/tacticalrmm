@@ -1737,9 +1737,12 @@ def enforce_file_transfer_session_limits(agent, user):
 
 def create_file_transfer_session_locked(agent, user, **fields):
     """Atomically enforce concurrency caps and create the session."""
+    from agents.tasks import expire_stale_file_transfer_sessions
+
     with transaction.atomic():
         # Lock the agent row so concurrent inits for this agent serialize here.
         Agent.objects.select_for_update().filter(pk=agent.pk).first()
+        expire_stale_file_transfer_sessions(agent=agent, notify_agent=False)
         limit_err = enforce_file_transfer_session_limits(agent, user)
         if limit_err is not None:
             return limit_err

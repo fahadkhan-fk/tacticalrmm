@@ -130,6 +130,15 @@ def _ensure_nats_notify_loop() -> asyncio.AbstractEventLoop:
     return _nats_notify_loop
 
 
+_NATS_UNAVAILABLE = ("timeout", "natsdown")
+
+
+def _nats_unavailable_error(result) -> Optional[Response]:
+    if result in _NATS_UNAVAILABLE:
+        return notify_error("Unable to contact the agent")
+    return None
+
+
 def send_nats_notification(agent, func: str, payload: dict) -> Optional[Response]:
     loop = _ensure_nats_notify_loop()
     data = {"func": func, "payload": payload}
@@ -138,10 +147,10 @@ def send_nats_notification(agent, func: str, payload: dict) -> Optional[Response
             agent.nats_cmd(data, wait=False),
             loop,
         )
-        future.result(timeout=10)
+        result = future.result(timeout=10)
     except Exception as e:
         return notify_error(f"NATS communication failed: {str(e)}")
-    return None
+    return _nats_unavailable_error(result)
 
 
 def send_nats_command(
@@ -153,8 +162,9 @@ def send_nats_command(
     except Exception as e:
         return notify_error(f"NATS communication failed: {str(e)}")
 
-    if response == "timeout":
-        return notify_error("Unable to contact the agent")
+    unavailable = _nats_unavailable_error(response)
+    if unavailable is not None:
+        return unavailable
 
     if isinstance(response, dict) and "error" in response:
         err = str(response["error"])

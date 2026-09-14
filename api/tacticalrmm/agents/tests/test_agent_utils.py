@@ -1,5 +1,5 @@
 import pickle
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.conf import settings
 from django.test import SimpleTestCase
@@ -10,6 +10,8 @@ from agents.utils import (
     get_agent_url,
     is_posix_abs_path,
     is_windows_path,
+    send_nats_command,
+    send_nats_notification,
     strip_relation_caches_for_cache,
     validate_file_browser_path,
     validate_file_transfer_destination_path,
@@ -162,3 +164,54 @@ class TestFileTransferPathValidation(SimpleTestCase):
         self.assertTrue(is_posix_abs_path("/bin/bash"))
         self.assertFalse(is_windows_path(r"C:\Program Files\it's.exe"))
         self.assertTrue(is_windows_path(r"C:\Windows\System32\cmd.exe"))
+
+
+class TestSendNatsHelpers(SimpleTestCase):
+    def _future(self, result):
+        future = MagicMock()
+        future.result.return_value = result
+        return future
+
+    @patch("agents.utils.asyncio.run_coroutine_threadsafe")
+    @patch("agents.utils._ensure_nats_notify_loop")
+    def test_send_nats_notification_natsdown_is_error(
+        self, _loop, mock_threadsafe
+    ) -> None:
+        """Connect failure is a string return, not an exception, must not look like success."""
+        mock_threadsafe.return_value = self._future("natsdown")
+        result = send_nats_notification(MagicMock(), "files_upload_chunk_available", {})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unable to contact the agent", result.data)
+
+    @patch("agents.utils.asyncio.run_coroutine_threadsafe")
+    @patch("agents.utils._ensure_nats_notify_loop")
+    def test_send_nats_notification_timeout_is_error(
+        self, _loop, mock_threadsafe
+    ) -> None:
+        mock_threadsafe.return_value = self._future("timeout")
+        result = send_nats_notification(MagicMock(), "files_download_ack", {})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unable to contact the agent", result.data)
+
+    @patch("agents.utils.asyncio.run_coroutine_threadsafe")
+    @patch("agents.utils._ensure_nats_notify_loop")
+    def test_send_nats_notification_success_returns_none(
+        self, _loop, mock_threadsafe
+    ) -> None:
+        mock_threadsafe.return_value = self._future(None)
+        result = send_nats_notification(MagicMock(), "files_upload_chunk_available", {})
+        self.assertIsNone(result)
+
+    @patch("agents.utils.asyncio.run")
+    def test_send_nats_command_natsdown_is_error(self, mock_run) -> None:
+        mock_run.return_value = "natsdown"
+        result = send_nats_command(MagicMock(), "files_list", {"path": "/"})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unable to contact the agent", result.data)
+
+    @patch("agents.utils.asyncio.run")
+    def test_send_nats_command_timeout_is_error(self, mock_run) -> None:
+        mock_run.return_value = "timeout"
+        result = send_nats_command(MagicMock(), "files_list", {"path": "/"})
+        self.assertEqual(result.status_code, 400)
+        self.assertIn("Unable to contact the agent", result.data)

@@ -21,6 +21,7 @@ from tacticalrmm.constants import (
     FileTransferOperation,
     FileTransferStatus,
 )
+from tacticalrmm.helpers import notify_error
 from tacticalrmm.test import TacticalTestCase
 
 
@@ -232,6 +233,16 @@ class TestListFiles(BaseFileBrowserAPITest):
     def test_list_files_timeout(self, mock_nats_cmd) -> None:
         """Should return error if agent times out."""
         mock_nats_cmd.return_value = "timeout"
+        response = self.client.get(
+            self.url, {"path": r"C:\Users\Public"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Unable to contact the agent", response.json())
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_list_files_natsdown(self, mock_nats_cmd) -> None:
+        """NATS connect failure must return error."""
+        mock_nats_cmd.return_value = "natsdown"
         response = self.client.get(
             self.url, {"path": r"C:\Users\Public"}, format="json"
         )
@@ -1161,6 +1172,34 @@ class TestUploadFileChunk(BaseFileBrowserAPITest):
         )
         session.refresh_from_db()
         self.assertEqual(session.status, FileTransferStatus.TRANSFERRING)
+
+    @patch("agents.views.rollback_upload_chunk")
+    @patch("agents.views.store_upload_chunk", return_value=None)
+    @patch("agents.views.get_accepted_offset", return_value=0)
+    @patch("agents.views.get_upload_ack", return_value=0)
+    @patch("agents.views.send_nats_notification")
+    def test_upload_chunk_natsdown_rolls_back_chunk(
+        self, mock_notify, _ack, _accepted, _store, mock_rollback
+    ) -> None:
+        """A nats down notify must not leave the chunk accepted in redis."""
+        mock_notify.return_value = notify_error("Unable to contact the agent")
+        session = self._make_transfer_session(
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=1024,
+            chunk_size=512,
+        )
+        response = self.client.put(
+            self._chunk_url(session.session_id),
+            data=b"x" * 512,
+            content_type="application/octet-stream",
+            HTTP_CONTENT_RANGE="bytes 0-511/1024",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Unable to contact the agent", response.json())
+        mock_rollback.assert_called_once()
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.FAILED)
 
 
 class TestCompleteFileUpload(BaseFileBrowserAPITest):

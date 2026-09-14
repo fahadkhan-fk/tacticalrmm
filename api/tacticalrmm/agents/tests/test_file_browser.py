@@ -13,6 +13,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_DEFAULT_PAGE_SIZE,
     FILE_BROWSER_MAX_PAGE,
     FILE_BROWSER_MAX_PAGE_SIZE,
+    FILE_BROWSER_MIN_AGENT_VERSION,
     FILE_TRANSFER_CHUNK_SIZE,
     FILE_TRANSFER_MAX_SESSIONS_PER_AGENT,
     FILE_TRANSFER_PIPELINE_DEPTH,
@@ -35,7 +36,7 @@ class BaseFileBrowserAPITest(TacticalTestCase):
         self.setup_coresettings()
         self.agent = baker.make(
             Agent,
-            version="2.10.0",
+            version="2.12.0",
             plat="windows",
             agent_id="filebrowser-test-agent-id-0001",
         )
@@ -272,6 +273,18 @@ class TestListFiles(BaseFileBrowserAPITest):
         invalid_url = reverse("list_files", args=["A" * 22])
         response = self.client.get(invalid_url, format="json")
         self.assertEqual(response.status_code, 404)
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_list_files_old_agent_version(self, mock_nats_cmd) -> None:
+        """Agents below 2.12.0 must return 400 immediately, not wait on unknown NATS funcs."""
+        self.agent.version = "2.11.9"
+        self.agent.save(update_fields=["version"])
+        response = self.client.get(
+            self.url, {"path": r"C:\Users\Public"}, format="json"
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(FILE_BROWSER_MIN_AGENT_VERSION, response.json())
+        mock_nats_cmd.assert_not_called()
 
     @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_delete_files_success(self, mock_nats_cmd) -> None:
@@ -1361,6 +1374,16 @@ class TestFileBrowserPermissions(BaseFileBrowserAPITest):
         response = self.client.get(url)
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertIn("file_browser_mode", response.json())
+        self.assertTrue(response.json()["supports_new_file_browser"])
+
+    def test_file_browser_defaults_old_agent_does_not_support_new(self) -> None:
+        """Defaults stay 200 for old agents so the UI can fall back to Mesh."""
+        self.agent.version = "2.10.0"
+        self.agent.save(update_fields=["version"])
+        url = reverse("file_browser_defaults", args=[self.agent.agent_id])
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertFalse(response.json()["supports_new_file_browser"])
 
     def test_copy_mesh_permission_to_file_browser(self) -> None:
         import importlib

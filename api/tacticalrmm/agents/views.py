@@ -65,6 +65,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_PROPERTIES_MAX_FILES,
     FILE_BROWSER_PROPERTIES_MAX_DEPTH,
     FILE_BROWSER_PROPERTIES_MAX_DURATION_SECONDS,
+    FILE_BROWSER_MIN_AGENT_VERSION,
     FileTransferConflictPolicy,
     FileTransferOperation,
     FileTransferStatus,
@@ -1858,7 +1859,9 @@ class ListFiles(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def get(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -1935,7 +1938,9 @@ class GetFileProperties(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def get(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2000,7 +2005,9 @@ class CreateFileFolder(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2052,7 +2059,9 @@ class RenameFile(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2101,7 +2110,7 @@ class RenameFile(APIView):
 
 
 def _delete_agent_files(request, agent_id):
-    agent = get_validated_agent(agent_id)
+    agent = get_validated_agent(agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION)
     if isinstance(agent, Response):
         return agent
 
@@ -2142,7 +2151,9 @@ class InitFileUpload(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2299,7 +2310,9 @@ class UploadFileChunk(APIView):
           accepted_offset  — client should start the next chunk here
           committed_offset — last offset confirmed written by the agent
         """
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2446,7 +2459,9 @@ class CompleteFileUpload(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id, session_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2648,7 +2663,9 @@ class InitFileDownload(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2756,7 +2773,9 @@ class InitFileDownloadArchive(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2881,7 +2900,9 @@ class GetFileDownloadChunk(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def get(self, request, agent_id, session_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -2944,7 +2965,9 @@ class AckFileDownloadChunk(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id, session_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -3035,7 +3058,9 @@ class CompleteFileDownload(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id, session_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -3171,7 +3196,9 @@ class CancelFileDownload(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id, session_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -3216,7 +3243,9 @@ class CancelFileUpload(APIView):
     permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
 
     def post(self, request, agent_id, session_id):
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -3283,7 +3312,9 @@ class ListFileTransfers(APIView):
 
     def get(self, request, agent_id):
         """List resumable file-transfer sessions for the current user on this agent."""
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -3323,7 +3354,9 @@ class GetFileDownloadStatus(APIView):
 
     def get(self, request, agent_id, session_id):
         """Lightweight status poll for a download session."""
-        agent = get_validated_agent(agent_id)
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
         if isinstance(agent, Response):
             return agent
 
@@ -3392,7 +3425,7 @@ class AgentFileBrowserDefaults(APIView):
         )
 
         supports_new_file_browser = True
-        if pyver.parse(agent.version) < pyver.parse("2.12.0"):
+        if pyver.parse(agent.version) < pyver.parse(FILE_BROWSER_MIN_AGENT_VERSION):
             supports_new_file_browser = False
 
         core_settings = CoreSettings.objects.only("file_browser_mode").first()

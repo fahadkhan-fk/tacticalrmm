@@ -65,8 +65,9 @@ class FileTransferNextChunk(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            from agents.views import _expire_transfer_session
+
+            _expire_transfer_session(session, agent)
             return notify_error("Upload session has expired")
 
         if session.status not in (
@@ -114,8 +115,9 @@ class FileTransferAck(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            from agents.views import _expire_transfer_session
+
+            _expire_transfer_session(session, agent)
             return notify_error("Upload session has expired")
 
         if session.status not in (
@@ -213,8 +215,9 @@ class FileTransferDownloadPutChunk(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            from agents.views import _expire_transfer_session
+
+            _expire_transfer_session(session, agent)
             return notify_error("Download session has expired")
 
         if session.status in _TERMINAL_STATUSES:
@@ -266,8 +269,9 @@ class FileTransferDownloadPutChunk(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            from agents.views import _expire_transfer_session
+
+            _expire_transfer_session(session, agent)
             return notify_error("Download session has expired")
 
         if session.status not in (

@@ -1787,8 +1787,7 @@ def _resume_file_upload(request, agent, data):
     )
 
     if session.expires_at <= djangotime.now():
-        session.status = FileTransferStatus.EXPIRED
-        session.save(update_fields=["status", "updated_at"])
+        _expire_transfer_session(session, agent)
         return notify_error("Upload session has expired and cannot be resumed")
 
     if session.status not in _FILE_TRANSFER_RESUMABLE_STATUSES:
@@ -2237,36 +2236,30 @@ class InitFileUpload(APIView):
         )
 
         if isinstance(response, Response):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(response.data)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(response.data))
             return response
 
         if not isinstance(response, dict):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid agent response"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, "Invalid agent response")
             return notify_error("Invalid agent response")
 
         if response.get("status") != "ready":
             error_message = response.get("error") or "Agent failed to prepare upload"
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(error_message)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(error_message))
             return notify_error(str(error_message))
 
         try:
             committed_offset = int(response.get("committed_offset", 0))
         except (TypeError, ValueError):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid committed_offset from agent"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(
+                session, agent, "Invalid committed_offset from agent"
+            )
             return notify_error("Invalid committed_offset from agent")
 
         if committed_offset < 0 or committed_offset > session.total_size:
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid committed_offset from agent"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(
+                session, agent, "Invalid committed_offset from agent"
+            )
             return notify_error("Invalid committed_offset from agent")
 
         session.status = FileTransferStatus.AGENT_READY
@@ -2328,8 +2321,7 @@ class UploadFileChunk(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            _expire_transfer_session(session, agent)
             return notify_error("Upload session has expired")
 
         if session.status not in (
@@ -2429,9 +2421,7 @@ class UploadFileChunk(APIView):
 
         if notify_err is not None:
             rollback_upload_chunk(session.session_id, start, prev_accepted=start)
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(notify_err.data)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(notify_err.data))
             return notify_err
 
         accepted_offset = end + 1
@@ -2477,8 +2467,7 @@ class CompleteFileUpload(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            _expire_transfer_session(session, agent)
             return notify_error("Upload session has expired")
 
         if session.status == FileTransferStatus.COMPLETED:
@@ -2540,22 +2529,16 @@ class CompleteFileUpload(APIView):
         )
 
         if isinstance(response, Response):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(response.data)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(response.data))
             return response
 
         if not isinstance(response, dict):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid agent response"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, "Invalid agent response")
             return notify_error("Invalid agent response")
 
         if response.get("status") != "completed":
             error_message = response.get("error") or "Agent failed to finalize upload"
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(error_message)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(error_message))
             return notify_error(str(error_message))
 
         clear_upload_session_redis(session.session_id)
@@ -2583,8 +2566,7 @@ def _resume_file_download(request, agent, data):
     )
 
     if session.expires_at <= djangotime.now():
-        session.status = FileTransferStatus.EXPIRED
-        session.save(update_fields=["status", "updated_at"])
+        _expire_transfer_session(session, agent)
         return notify_error("Download session has expired and cannot be resumed")
 
     if session.status not in _FILE_TRANSFER_RESUMABLE_STATUSES:
@@ -2713,36 +2695,28 @@ class InitFileDownload(APIView):
         )
 
         if isinstance(response, Response):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(response.data)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(response.data))
             return response
 
         if not isinstance(response, dict):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid agent response"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, "Invalid agent response")
             return notify_error("Invalid agent response")
 
         if response.get("status") != "ready":
             error_message = response.get("error") or "Agent failed to prepare download"
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(error_message)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(error_message))
             return notify_error(str(error_message))
 
         try:
             total_size = int(response.get("total_size", 0))
         except (TypeError, ValueError):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid total_size from agent"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, "Invalid total_size from agent")
             return notify_error("Invalid total_size from agent")
 
         if total_size < 1:
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Agent reported empty or invalid file"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(
+                session, agent, "Agent reported empty or invalid file"
+            )
             return notify_error("Agent reported empty or invalid file")
 
         session.total_size = total_size
@@ -2852,25 +2826,18 @@ class InitFileDownloadArchive(APIView):
         )
 
         if isinstance(response, Response):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(response.data)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(response.data))
             return response
 
         if not isinstance(response, dict):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid agent response"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, "Invalid agent response")
             return notify_error("Invalid agent response")
 
         if response.get("status") != "building":
             error_message = (
                 response.get("error") or "Agent failed to start archive build"
             )
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(error_message)
-            session.save(update_fields=["status", "error_message", "updated_at"])
-            _log_transfer_terminal(session)
+            _fail_transfer_session(session, agent, str(error_message))
             return notify_error(str(error_message))
 
         _audit_file_browser(
@@ -2918,8 +2885,7 @@ class GetFileDownloadChunk(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            _expire_transfer_session(session, agent)
             return notify_error("Download session has expired")
 
         if session.status not in (
@@ -2983,8 +2949,7 @@ class AckFileDownloadChunk(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            _expire_transfer_session(session, agent)
             return notify_error("Download session has expired")
 
         if session.status not in (
@@ -3076,8 +3041,7 @@ class CompleteFileDownload(APIView):
         )
 
         if session.expires_at <= djangotime.now():
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            _expire_transfer_session(session, agent)
             return notify_error("Download session has expired")
 
         if session.status not in (
@@ -3115,22 +3079,16 @@ class CompleteFileDownload(APIView):
         )
 
         if isinstance(response, Response):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(response.data)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(response.data))
             return response
 
         if not isinstance(response, dict):
-            session.status = FileTransferStatus.FAILED
-            session.error_message = "Invalid agent response"
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, "Invalid agent response")
             return notify_error("Invalid agent response")
 
         if response.get("status") != "completed":
             error_message = response.get("error") or "Agent failed to finalize download"
-            session.status = FileTransferStatus.FAILED
-            session.error_message = str(error_message)
-            session.save(update_fields=["status", "error_message", "updated_at"])
+            _fail_transfer_session(session, agent, str(error_message))
             return notify_error(str(error_message))
 
         clear_download_session_redis(session.session_id)
@@ -3148,6 +3106,13 @@ class CompleteFileDownload(APIView):
         )
 
 
+_FILE_TRANSFER_AGENT_RELEASE_TIMEOUT = 5
+_FILE_TRANSFER_RELEASED_STATUSES = (
+    FileTransferStatus.COMPLETED,
+    FileTransferStatus.CANCELLED,
+)
+
+
 def _release_download_session(
     session: FileTransferSession,
     agent,
@@ -3160,7 +3125,10 @@ def _release_download_session(
         "source_path": session.destination_path,
     }
     response = send_nats_command(
-        agent, "files_download_finalize", finalize_payload, timeout=30
+        agent,
+        "files_download_finalize",
+        finalize_payload,
+        timeout=_FILE_TRANSFER_AGENT_RELEASE_TIMEOUT,
     )
     if isinstance(response, dict) and response.get("error"):
         logger.warning(
@@ -3182,7 +3150,12 @@ def _release_upload_session(
 ) -> None:
     clear_upload_session_redis(session.session_id)
     abort_payload = {"session_id": str(session.session_id)}
-    response = send_nats_command(agent, "files_upload_abort", abort_payload, timeout=30)
+    response = send_nats_command(
+        agent,
+        "files_upload_abort",
+        abort_payload,
+        timeout=_FILE_TRANSFER_AGENT_RELEASE_TIMEOUT,
+    )
     if isinstance(response, dict) and response.get("error"):
         logger.warning(
             "file_transfer upload release session=%s agent abort: %s",
@@ -3193,6 +3166,46 @@ def _release_upload_session(
     session.error_message = error_message
     session.save(update_fields=["status", "error_message", "updated_at"])
     _log_transfer_terminal(session, error_message)
+
+
+def _fail_transfer_session(
+    session: FileTransferSession,
+    agent,
+    error_message: str,
+) -> None:
+    message = (error_message or "Transfer failed")[:2048]
+    if session.operation == FileTransferOperation.UPLOAD:
+        _release_upload_session(
+            session,
+            agent,
+            error_message=message,
+            new_status=FileTransferStatus.FAILED,
+        )
+        return
+    _release_download_session(
+        session,
+        agent,
+        error_message=message,
+        new_status=FileTransferStatus.FAILED,
+    )
+
+
+def _expire_transfer_session(session: FileTransferSession, agent) -> None:
+    message = session.error_message or "Session expired"
+    if session.operation == FileTransferOperation.UPLOAD:
+        _release_upload_session(
+            session,
+            agent,
+            error_message=message,
+            new_status=FileTransferStatus.EXPIRED,
+        )
+        return
+    _release_download_session(
+        session,
+        agent,
+        error_message=message,
+        new_status=FileTransferStatus.EXPIRED,
+    )
 
 
 class CancelFileDownload(APIView):
@@ -3213,12 +3226,26 @@ class CancelFileDownload(APIView):
             operation=FileTransferOperation.DOWNLOAD,
         )
 
+        if session.status in _FILE_TRANSFER_RELEASED_STATUSES:
+            return Response(
+                {"session_id": str(session.session_id), "status": session.status}
+            )
+
         if session.status in (
-            FileTransferStatus.COMPLETED,
             FileTransferStatus.FAILED,
-            FileTransferStatus.CANCELLED,
             FileTransferStatus.EXPIRED,
         ):
+            _release_download_session(
+                session,
+                agent,
+                error_message=session.error_message
+                or (
+                    "Session expired"
+                    if session.status == FileTransferStatus.EXPIRED
+                    else "Download released after failure"
+                ),
+                new_status=session.status,
+            )
             return Response(
                 {"session_id": str(session.session_id), "status": session.status}
             )
@@ -3260,12 +3287,26 @@ class CancelFileUpload(APIView):
             operation=FileTransferOperation.UPLOAD,
         )
 
+        if session.status in _FILE_TRANSFER_RELEASED_STATUSES:
+            return Response(
+                {"session_id": str(session.session_id), "status": session.status}
+            )
+
         if session.status in (
-            FileTransferStatus.COMPLETED,
             FileTransferStatus.FAILED,
-            FileTransferStatus.CANCELLED,
             FileTransferStatus.EXPIRED,
         ):
+            _release_upload_session(
+                session,
+                agent,
+                error_message=session.error_message
+                or (
+                    "Session expired"
+                    if session.status == FileTransferStatus.EXPIRED
+                    else "Upload released after failure"
+                ),
+                new_status=session.status,
+            )
             return Response(
                 {"session_id": str(session.session_id), "status": session.status}
             )
@@ -3375,8 +3416,7 @@ class GetFileDownloadStatus(APIView):
             session.status in _FILE_TRANSFER_ACTIVE_STATUSES
             and session.expires_at <= djangotime.now()
         ):
-            session.status = FileTransferStatus.EXPIRED
-            session.save(update_fields=["status", "updated_at"])
+            _expire_transfer_session(session, agent)
 
         return Response(
             {

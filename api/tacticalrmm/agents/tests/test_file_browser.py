@@ -645,6 +645,9 @@ class TestInitFileUpload(BaseFileBrowserAPITest):
         self.assertEqual(
             FileTransferSession.objects.get().status, FileTransferStatus.FAILED
         )
+        funcs = [call[0][0]["func"] for call in mock_nats_cmd.call_args_list]
+        self.assertIn("files_upload_prepare", funcs)
+        self.assertIn("files_upload_abort", funcs)
 
     def test_init_file_upload_session_limit_returns_429(self) -> None:
         """Fresh init should 429 when the per-agent concurrency cap is full."""
@@ -773,13 +776,50 @@ class TestCancelFileUpload(BaseFileBrowserAPITest):
     def test_cancel_file_upload_already_terminal(
         self, mock_nats_cmd, _mock_clear
     ) -> None:
-        """Terminal sessions should be idempotent without contacting the agent."""
+        """Completed sessions should be idempotent without contacting the agent."""
         session = self._make_transfer_session(status=FileTransferStatus.COMPLETED)
         url = self._session_url("cancel_file_upload", session.session_id)
         response = self.client.post(url, {}, format="json")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], FileTransferStatus.COMPLETED)
         mock_nats_cmd.assert_not_called()
+
+    @patch("agents.views.clear_upload_session_redis")
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_cancel_file_upload_failed_still_aborts(
+        self, mock_nats_cmd, _mock_clear
+    ) -> None:
+        """Failed sessions must still tell the agent to drop the handle or .partial."""
+        session = self._make_transfer_session(
+            status=FileTransferStatus.FAILED,
+            error_message="Upload failed",
+        )
+        mock_nats_cmd.return_value = {"status": "aborted"}
+        url = self._session_url("cancel_file_upload", session.session_id)
+        response = self.client.post(url, {"reason": "error"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], FileTransferStatus.FAILED)
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.FAILED)
+        mock_nats_cmd.assert_called_once()
+        self.assertEqual(mock_nats_cmd.call_args[0][0]["func"], "files_upload_abort")
+
+    @patch("agents.views.clear_upload_session_redis")
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_cancel_file_upload_expired_still_aborts(
+        self, mock_nats_cmd, _mock_clear
+    ) -> None:
+        """Expired sessions must still abort on the agent."""
+        session = self._make_transfer_session(status=FileTransferStatus.EXPIRED)
+        mock_nats_cmd.return_value = {"status": "aborted"}
+        url = self._session_url("cancel_file_upload", session.session_id)
+        response = self.client.post(url, {"reason": "error"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], FileTransferStatus.EXPIRED)
+        mock_nats_cmd.assert_called_once()
+        self.assertEqual(mock_nats_cmd.call_args[0][0]["func"], "files_upload_abort")
 
     def test_cancel_file_upload_not_found(self) -> None:
         """Unknown session should 404."""
@@ -865,6 +905,9 @@ class TestInitFileDownload(BaseFileBrowserAPITest):
         self.assertEqual(
             FileTransferSession.objects.get().status, FileTransferStatus.FAILED
         )
+        funcs = [call[0][0]["func"] for call in mock_nats_cmd.call_args_list]
+        self.assertIn("files_download_prepare", funcs)
+        self.assertIn("files_download_finalize", funcs)
 
     def test_init_file_download_session_limit_returns_429(self) -> None:
         """Fresh download init should honor the per-agent concurrency cap."""
@@ -1047,6 +1090,30 @@ class TestCancelFileDownload(BaseFileBrowserAPITest):
         self.assertEqual(session.status, FileTransferStatus.FAILED)
         self.assertIn("failure", session.error_message.lower())
 
+    @patch("agents.views.clear_download_session_redis")
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_cancel_file_download_failed_still_finalizes(
+        self, mock_nats_cmd, _mock_clear
+    ) -> None:
+        """Failed downloads must still tell the agent to close the file handle."""
+        session = self._make_transfer_session(
+            operation=FileTransferOperation.DOWNLOAD,
+            status=FileTransferStatus.FAILED,
+            destination_path=r"C:\Users\Public\readme.txt",
+            filename="readme.txt",
+            error_message="Download failed",
+        )
+        mock_nats_cmd.return_value = {"status": "completed"}
+        url = self._session_url("cancel_file_download", session.session_id)
+        response = self.client.post(url, {"reason": "error"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], FileTransferStatus.FAILED)
+        mock_nats_cmd.assert_called_once()
+        self.assertEqual(
+            mock_nats_cmd.call_args[0][0]["func"], "files_download_finalize"
+        )
+
     def test_cancel_other_users_download_is_not_found(self) -> None:
         """Cancel stays owner scoped; another user's download is not visible."""
         session = self._make_transfer_session(
@@ -1084,8 +1151,13 @@ class TestGetFileDownloadStatus(BaseFileBrowserAPITest):
         self.assertEqual(body["warnings"], ["skipped symlink"])
         self.assertEqual(body["filename"], "Docs.zip")
 
-    def test_get_file_download_status_marks_expired(self) -> None:
-        """Active sessions past expires_at should flip to expired on poll."""
+    @patch("agents.views.clear_download_session_redis")
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_get_file_download_status_marks_expired(
+        self, mock_nats_cmd, _mock_clear
+    ) -> None:
+        """Active sessions past expires_at should expire and release the agent."""
+        mock_nats_cmd.return_value = {"status": "completed"}
         session = self._make_transfer_session(
             operation=FileTransferOperation.DOWNLOAD,
             status=FileTransferStatus.WAITING_FOR_AGENT,
@@ -1102,6 +1174,11 @@ class TestGetFileDownloadStatus(BaseFileBrowserAPITest):
         self.assertEqual(response.json()["status"], FileTransferStatus.EXPIRED)
         session.refresh_from_db()
         self.assertEqual(session.status, FileTransferStatus.EXPIRED)
+        self.assertEqual(session.error_message, "Session expired")
+        mock_nats_cmd.assert_called_once()
+        self.assertEqual(
+            mock_nats_cmd.call_args[0][0]["func"], "files_download_finalize"
+        )
 
     def test_get_file_download_status_other_user_is_not_found(self) -> None:
         """Status stays owner scoped."""
@@ -1238,10 +1315,12 @@ class TestUploadFileChunk(BaseFileBrowserAPITest):
     @patch("agents.views.get_accepted_offset", return_value=0)
     @patch("agents.views.get_upload_ack", return_value=0)
     @patch("agents.views.send_nats_notification")
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
     def test_upload_chunk_natsdown_rolls_back_chunk(
-        self, mock_notify, _ack, _accepted, _store, mock_rollback
+        self, mock_nats_cmd, mock_notify, _ack, _accepted, _store, mock_rollback
     ) -> None:
         """A nats down notify must not leave the chunk accepted in redis."""
+        mock_nats_cmd.return_value = {"status": "aborted"}
         mock_notify.return_value = notify_error("Unable to contact the agent")
         session = self._make_transfer_session(
             status=FileTransferStatus.TRANSFERRING,
@@ -1260,6 +1339,35 @@ class TestUploadFileChunk(BaseFileBrowserAPITest):
         mock_rollback.assert_called_once()
         session.refresh_from_db()
         self.assertEqual(session.status, FileTransferStatus.FAILED)
+        mock_nats_cmd.assert_called_once()
+        self.assertEqual(mock_nats_cmd.call_args[0][0]["func"], "files_upload_abort")
+
+    @patch("agents.views.clear_upload_session_redis")
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_upload_chunk_expired_aborts_agent(
+        self, mock_nats_cmd, _mock_clear
+    ) -> None:
+        """TTL expiry on a chunk PUT must abort the agent session."""
+        mock_nats_cmd.return_value = {"status": "aborted"}
+        session = self._make_transfer_session(
+            status=FileTransferStatus.TRANSFERRING,
+            committed_offset=0,
+            total_size=1024,
+            chunk_size=512,
+            expires_at=djangotime.now() - dt.timedelta(minutes=1),
+        )
+        response = self.client.put(
+            self._chunk_url(session.session_id),
+            data=b"x" * 512,
+            content_type="application/octet-stream",
+            HTTP_CONTENT_RANGE="bytes 0-511/1024",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("expired", response.json())
+        session.refresh_from_db()
+        self.assertEqual(session.status, FileTransferStatus.EXPIRED)
+        mock_nats_cmd.assert_called_once()
+        self.assertEqual(mock_nats_cmd.call_args[0][0]["func"], "files_upload_abort")
 
 
 class TestCompleteFileUpload(BaseFileBrowserAPITest):
@@ -1542,6 +1650,27 @@ class TestExpireStaleFileTransfers(BaseFileBrowserAPITest):
             format="json",
         )
         self.assertEqual(response.status_code, 200)
+
+    @patch("agents.file_transfer_relay.clear_download_session_redis")
+    @patch("agents.file_transfer_relay.clear_upload_session_redis")
+    @patch("agents.utils.send_nats_command")
+    def test_already_expired_without_error_notifies_agent(
+        self, mock_nats, *_clears
+    ) -> None:
+        """Celery must still abort sessions that expired without an agent release."""
+        from agents.tasks import expire_stale_file_transfer_sessions
+
+        self.agent.last_seen = djangotime.now()
+        self.agent.save(update_fields=["last_seen"])
+        session = self._make_transfer_session(
+            status=FileTransferStatus.EXPIRED,
+            error_message="",
+        )
+        expire_stale_file_transfer_sessions(notify_agent=True)
+        session.refresh_from_db()
+        self.assertEqual(session.error_message, "Session expired")
+        mock_nats.assert_called_once()
+        self.assertEqual(mock_nats.call_args[0][1], "files_upload_abort")
 
     def test_cleanup_task_runs_every_ten_minutes(self) -> None:
         from celery.schedules import crontab

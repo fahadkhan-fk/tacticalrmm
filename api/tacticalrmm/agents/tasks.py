@@ -372,6 +372,27 @@ def expire_stale_file_transfer_sessions(
             session.error_message,
         )
         expired_count += 1
+
+    if notify_agent:
+        leftover_expired = FileTransferSession.objects.filter(
+            status=FileTransferStatus.EXPIRED,
+            error_message="",
+        ).select_related("agent")
+        if agent is not None:
+            leftover_expired = leftover_expired.filter(agent=agent)
+        for session in leftover_expired.iterator():
+            _clear_redis(session)
+            _notify_agent_release(session)
+            session.error_message = "Session expired"
+            session.save(update_fields=["error_message", "updated_at"])
+            logger.error(
+                "file_transfer session=%s operation=%s status=%s: %s",
+                session.session_id,
+                session.operation,
+                session.status,
+                session.error_message,
+            )
+            expired_count += 1
     return expired_count
 
 

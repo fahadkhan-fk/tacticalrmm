@@ -99,6 +99,11 @@ urlpatterns = [
         name="get_file_properties",
     ),
     path(
+        "<agent:agent_id>/files/exists/",
+        views.CheckFileExists.as_view(),
+        name="check_file_exists",
+    ),
+    path(
         "<agent:agent_id>/files/folder/",
         views.CreateFileFolder.as_view(),
         name="create_file_folder",

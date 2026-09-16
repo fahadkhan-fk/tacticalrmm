@@ -344,6 +344,48 @@ class TestListFiles(BaseFileBrowserAPITest):
         self.assertIn("NATS communication failed", response.json())
 
 
+class TestCheckFileExists(BaseFileBrowserAPITest):
+    api_name = "check_file_exists"
+
+    def test_exists_missing_path(self) -> None:
+        response = self.client.post(self.url, {"names": ["a.txt"]}, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("path is required", response.json())
+
+    def test_exists_names_must_be_list(self) -> None:
+        response = self.client.post(
+            self.url,
+            {"path": r"C:\Users\Public", "names": "a.txt"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("names must be a list", response.json())
+
+    def test_exists_rejects_path_in_name(self) -> None:
+        response = self.client.post(
+            self.url,
+            {"path": r"C:\Users\Public", "names": ["bad\\name.txt"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_exists_success(self, mock_nats_cmd) -> None:
+        mock_nats_cmd.return_value = {"existing": ["readme.txt"]}
+        response = self.client.post(
+            self.url,
+            {"path": r"C:\Users\Public", "names": ["readme.txt", "new.txt"]},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["existing"], ["readme.txt"])
+        mock_nats_cmd.assert_called_once()
+        payload = mock_nats_cmd.call_args[0][0]
+        self.assertEqual(payload["func"], "files_exists")
+        self.assertEqual(payload["payload"]["path"], r"C:\Users\Public")
+        self.assertIn("readme.txt", payload["payload"]["names_json"])
+
+
 class TestGetFileProperties(BaseFileBrowserAPITest):
     api_name = "get_file_properties"
 

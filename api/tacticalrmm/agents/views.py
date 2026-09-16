@@ -66,6 +66,7 @@ from tacticalrmm.constants import (
     FILE_BROWSER_PROPERTIES_MAX_DEPTH,
     FILE_BROWSER_PROPERTIES_MAX_DURATION_SECONDS,
     FILE_BROWSER_MIN_AGENT_VERSION,
+    FILE_BROWSER_MAX_EXISTS_NAMES,
     FileTransferConflictPolicy,
     FileTransferOperation,
     FileTransferStatus,
@@ -2001,6 +2002,70 @@ def _log_transfer_terminal(session: FileTransferSession, detail: str = "") -> No
         session.status,
         message,
     )
+
+
+class CheckFileExists(APIView):
+    permission_classes = [IsAuthenticated, AgentFileBrowserPerms]
+
+    def post(self, request, agent_id):
+        agent = get_validated_agent(
+            agent_id, min_version=FILE_BROWSER_MIN_AGENT_VERSION
+        )
+        if isinstance(agent, Response):
+            return agent
+
+        path = (request.data.get("path") or "").strip()
+        if not path:
+            return notify_error("path is required")
+        path_err = validate_file_browser_path(path, agent.plat)
+        if path_err:
+            return notify_error(path_err)
+
+        raw_names = request.data.get("names")
+        if not isinstance(raw_names, list):
+            return notify_error("names must be a list")
+        if len(raw_names) > FILE_BROWSER_MAX_EXISTS_NAMES:
+            return notify_error(
+                f"Select at most {FILE_BROWSER_MAX_EXISTS_NAMES} names to check"
+            )
+
+        names = []
+        seen = set()
+        for raw in raw_names:
+            name_err = validate_file_browser_name(raw, field="names")
+            if name_err:
+                return notify_error(name_err)
+            name = str(raw).strip()
+            key = name.lower() if agent.plat == "windows" else name
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(name)
+        if not names:
+            return notify_error("names must contain at least one name")
+
+        response = send_nats_command(
+            agent,
+            "files_exists",
+            {
+                "path": path,
+                "names_json": json.dumps(names),
+            },
+            timeout=30,
+        )
+        if isinstance(response, Response):
+            return response
+        if not isinstance(response, dict):
+            return notify_error("Invalid agent response")
+        if response.get("error"):
+            return notify_error(str(response.get("error")))
+
+        existing_raw = response.get("existing", [])
+        existing = []
+        if isinstance(existing_raw, list):
+            existing = [str(item) for item in existing_raw if str(item).strip()]
+
+        return Response({"existing": existing})
 
 
 class CreateFileFolder(APIView):

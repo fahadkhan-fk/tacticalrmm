@@ -596,6 +596,17 @@ class TestInitFileUpload(BaseFileBrowserAPITest):
         self.assertEqual(response.status_code, 400)
         self.assertIn("filename", response.json())
 
+    def test_init_file_upload_trailing_period_returns_400(self) -> None:
+        """Windows would silently store trail. as trail; reject instead."""
+        response = self.client.post(
+            self.url,
+            self._upload_payload(filename="trail."),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("period", response.json())
+        self.assertFalse(FileTransferSession.objects.filter(agent=self.agent).exists())
+
     def test_init_file_upload_invalid_total_size(self) -> None:
         """Should require a positive total_size."""
         response = self.client.post(
@@ -976,6 +987,35 @@ class TestInitFileDownload(BaseFileBrowserAPITest):
         response = self.client.post(self.url, {"source_path": 123}, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("source_path", response.json())
+
+    def test_init_file_download_long_filename_returns_400(self) -> None:
+        """Derived basename over 255 chars must be 400, not a DataError 500."""
+        leaf = ("a" * 256) + ".txt"
+        response = self.client.post(
+            self.url,
+            {"source_path": rf"C:\Users\Public\{leaf}"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("too long", response.json())
+        self.assertFalse(FileTransferSession.objects.filter(agent=self.agent).exists())
+
+    @patch("agents.models.Agent.nats_cmd", new_callable=AsyncMock)
+    def test_init_file_download_max_filename_succeeds(self, mock_nats_cmd) -> None:
+        """A 255-character basename is the column limit and must still init."""
+        mock_nats_cmd.return_value = {"status": "ready", "total_size": 2048}
+        leaf = "a" * 251 + ".txt"
+        self.assertEqual(len(leaf), 255)
+        response = self.client.post(
+            self.url,
+            {"source_path": rf"C:\Users\Public\{leaf}"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200)
+        session = FileTransferSession.objects.get(
+            session_id=response.json()["session_id"]
+        )
+        self.assertEqual(session.filename, leaf)
 
     def test_init_file_download_invalid_resume_offset_returns_400(self) -> None:
         """Resume offset that is not an integer must be 400."""

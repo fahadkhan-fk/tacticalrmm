@@ -17,6 +17,7 @@ from agents.utils import (
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
     validate_file_transfer_source_path,
+    normalize_file_browser_path,
 )
 from automation.models import Policy
 from checks.models import Check
@@ -129,6 +130,16 @@ class TestFileTransferPathValidation(SimpleTestCase):
         self.assertIsNone(validate_file_transfer_source_path(posix_file, "linux"))
         self.assertIsNone(validate_file_browser_path(posix_dir, "linux"))
         self.assertIsNone(validate_file_transfer_filename("it's & co.txt"))
+        self.assertIsNotNone(validate_file_transfer_filename("trail."))
+        self.assertIn(
+            "period",
+            validate_file_transfer_filename("trail.") or "",
+        )
+        self.assertIsNone(
+            validate_file_transfer_filename(
+                "trail.", ban_trailing_space_or_period=False
+            )
+        )
 
         paths, err = collect_file_transfer_paths(
             [posix_file, '/tmp/quote"file.txt'], "linux"
@@ -156,6 +167,20 @@ class TestFileTransferPathValidation(SimpleTestCase):
         self.assertIsNotNone(
             validate_file_transfer_destination_path("/tmp/foo\x00bar", "linux")
         )
+
+    def test_posix_backslash_is_not_a_separator(self) -> None:
+        linux_file = r"/tmp/a\b"
+        self.assertEqual(normalize_file_browser_path(linux_file, "linux"), linux_file)
+        self.assertIsNone(validate_file_browser_path(linux_file, "linux"))
+        self.assertIsNone(validate_file_transfer_source_path(linux_file, "linux"))
+        self.assertEqual(
+            normalize_file_browser_path(r"C:/Users/Public", "windows"),
+            r"C:\Users\Public",
+        )
+
+    def test_posix_backslash_dotdot_is_not_traversal(self) -> None:
+        self.assertIsNone(validate_file_browser_path(r"/tmp/foo\../bar", "linux"))
+        self.assertIsNotNone(validate_file_browser_path("/tmp/../etc", "linux"))
 
     def test_shell_helpers_still_ban_metas(self) -> None:
         """Custom shell fields still must not contain injection characters."""

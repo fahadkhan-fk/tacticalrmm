@@ -2732,6 +2732,13 @@ class InitFileDownload(APIView):
         if path_err:
             return notify_error(path_err)
 
+        filename = source_path.split("/")[-1].split("\\")[-1] or "download"
+        filename_err = validate_file_transfer_filename(
+            filename, ban_trailing_space_or_period=False
+        )
+        if filename_err:
+            return notify_error(filename_err)
+
         chunk_size = _file_transfer_chunk_size(data.get("chunk_size"))
 
         session = create_file_transfer_session_locked(
@@ -2740,7 +2747,7 @@ class InitFileDownload(APIView):
             operation=FileTransferOperation.DOWNLOAD,
             status=FileTransferStatus.WAITING_FOR_AGENT,
             destination_path=source_path,
-            filename=source_path.split("/")[-1].split("\\")[-1] or "download",
+            filename=filename,
             total_size=0,
             chunk_size=chunk_size,
             committed_offset=0,

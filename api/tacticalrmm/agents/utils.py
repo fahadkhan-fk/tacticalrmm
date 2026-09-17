@@ -269,8 +269,12 @@ _WINDOWS_ABS_PATH_RE = re.compile(r"^(?:[a-zA-Z]:\\|\\\\[^\\]+\\[^\\]+)")
 _PATH_CONTROL_CHARS = ("\n", "\r", "\x00")
 
 
-def _path_has_traversal(path: str) -> bool:
-    parts = re.split(r"[\\/]+", path.strip())
+def _path_has_traversal(path: str, plat: str = "") -> bool:
+    value = (path or "").strip()
+    if plat == "windows":
+        parts = re.split(r"[\\/]+", value)
+    else:
+        parts = value.split("/")
     return ".." in parts
 
 
@@ -307,9 +311,13 @@ def validate_file_browser_name(raw_name, field: str = "name") -> Optional[str]:
     return validate_fs_name(raw_name, field=field, ban_trailing_space_or_period=True)
 
 
-def validate_file_transfer_filename(filename: str) -> Optional[str]:
+def validate_file_transfer_filename(
+    filename: str, *, ban_trailing_space_or_period: bool = True
+) -> Optional[str]:
     return validate_fs_name(
-        filename, field="filename", ban_trailing_space_or_period=False
+        filename,
+        field="filename",
+        ban_trailing_space_or_period=ban_trailing_space_or_period,
     )
 
 
@@ -331,7 +339,7 @@ def validate_absolute_agent_path(
 
     if any(x in value for x in _PATH_CONTROL_CHARS):
         return f"{field} contains invalid characters"
-    if _path_has_traversal(value):
+    if _path_has_traversal(value, plat):
         return f"{field} must not contain path traversal"
 
     if plat == "windows":
@@ -470,7 +478,6 @@ def normalize_file_browser_path(path: str, plat: str) -> str:
             return value if value.endswith("\\") else f"{value}\\"
         return value
 
-    value = value.replace("\\", "/")
     if value != "/":
         value = value.rstrip("/")
     return value or "/"

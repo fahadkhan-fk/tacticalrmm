@@ -1,11 +1,13 @@
 import pickle
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 from django.conf import settings
 from django.test import SimpleTestCase
 
 from agents.utils import (
     collect_file_transfer_paths,
+    canonical_file_browser_path,
     generate_linux_install,
     get_agent_url,
     is_posix_abs_path,
@@ -182,6 +184,23 @@ class TestFileTransferPathValidation(SimpleTestCase):
         self.assertIsNone(validate_file_browser_path(r"/tmp/foo\../bar", "linux"))
         self.assertIsNotNone(validate_file_browser_path("/tmp/../etc", "linux"))
 
+    def test_canonical_file_browser_path_matches_agent(self) -> None:
+        path, err = canonical_file_browser_path("C:", "windows")
+        self.assertIsNone(err)
+        self.assertEqual(path, "C:\\")
+
+        path, err = canonical_file_browser_path("C:/Users/Public", "windows")
+        self.assertIsNone(err)
+        self.assertEqual(path, r"C:\Users\Public")
+
+        path, err = canonical_file_browser_path("/tmp/foo/", "linux")
+        self.assertIsNone(err)
+        self.assertEqual(path, "/tmp/foo")
+
+        path, err = canonical_file_browser_path(r"/tmp/a\b", "linux")
+        self.assertIsNone(err)
+        self.assertEqual(path, r"/tmp/a\b")
+
     def test_shell_helpers_still_ban_metas(self) -> None:
         """Custom shell fields still must not contain injection characters."""
         self.assertFalse(is_posix_abs_path("/bin/bash;id"))
@@ -240,3 +259,82 @@ class TestSendNatsHelpers(SimpleTestCase):
         result = send_nats_command(MagicMock(), "files_list", {"path": "/"})
         self.assertEqual(result.status_code, 400)
         self.assertIn("Unable to contact the agent", result.data)
+
+
+class TestFileTransferAckKeys(SimpleTestCase):
+    @patch("agents.file_transfer_relay._redis_client")
+    def test_signal_upload_ack_sets_scalar_only(self, mock_redis_client) -> None:
+        client = MagicMock()
+        mock_redis_client.return_value = client
+        from agents.file_transfer_relay import signal_upload_ack
+        from tacticalrmm.constants import FILE_TRANSFER_REDIS_ACK_TTL_SECONDS
+
+        session_id = uuid4()
+        signal_upload_ack(session_id, 8192)
+        client.set.assert_called_once_with(
+            f"upload:ack:{session_id}",
+            b"8192",
+            ex=FILE_TRANSFER_REDIS_ACK_TTL_SECONDS,
+        )
+        client.pipeline.assert_not_called()
+        client.lpush.assert_not_called()
+
+    @patch("agents.file_transfer_relay._redis_client")
+    def test_signal_download_ack_sets_scalar_only(self, mock_redis_client) -> None:
+        client = MagicMock()
+        mock_redis_client.return_value = client
+        from agents.file_transfer_relay import signal_download_ack
+        from tacticalrmm.constants import FILE_TRANSFER_REDIS_ACK_TTL_SECONDS
+
+        session_id = uuid4()
+        signal_download_ack(session_id, 4096)
+        client.set.assert_called_once_with(
+            f"download:ack:{session_id}",
+            b"4096",
+            ex=FILE_TRANSFER_REDIS_ACK_TTL_SECONDS,
+        )
+        client.pipeline.assert_not_called()
+        client.lpush.assert_not_called()
+
+    @patch("agents.file_transfer_relay._redis_client")
+    def test_clear_upload_does_not_scan_ack_events(self, mock_redis_client) -> None:
+        client = MagicMock()
+        client.scan_iter.return_value = []
+        mock_redis_client.return_value = client
+        from agents.file_transfer_relay import clear_upload_session_redis
+
+        session_id = uuid4()
+        clear_upload_session_redis(session_id)
+        patterns = [call.kwargs["match"] for call in client.scan_iter.call_args_list]
+        self.assertEqual(patterns, [f"upload:chunk:{session_id}/*"])
+        self.assertFalse(any("ack_event" in pattern for pattern in patterns))
+
+    @patch("agents.file_transfer_relay._redis_client")
+    def test_clear_download_does_not_scan_event_lists(self, mock_redis_client) -> None:
+        client = MagicMock()
+        client.scan_iter.return_value = []
+        mock_redis_client.return_value = client
+        from agents.file_transfer_relay import clear_download_session_redis
+
+        session_id = uuid4()
+        clear_download_session_redis(session_id)
+        patterns = [call.kwargs["match"] for call in client.scan_iter.call_args_list]
+        self.assertEqual(patterns, [f"download:chunk:{session_id}/*"])
+        self.assertFalse(
+            any(
+                "ack_event" in pattern or "chunk_event" in pattern
+                for pattern in patterns
+            )
+        )
+
+    @patch("agents.file_transfer_relay._redis_client")
+    def test_wait_for_upload_ack_reads_scalar_key(self, mock_redis_client) -> None:
+        client = MagicMock()
+        client.get.return_value = b"8192"
+        mock_redis_client.return_value = client
+        from agents.file_transfer_relay import wait_for_upload_ack
+
+        session_id = uuid4()
+        self.assertEqual(wait_for_upload_ack(session_id, 4096, timeout=1), 8192)
+        client.get.assert_called_with(f"upload:ack:{session_id}")
+        client.blpop.assert_not_called()

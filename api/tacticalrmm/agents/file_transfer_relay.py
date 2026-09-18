@@ -98,16 +98,16 @@ def _chunk_meta_key_at(session_id: UUID, start: int) -> str:
     return f"{_chunk_prefix(session_id)}{start}:meta"
 
 
+def pipeline_depth_full(ahead_offset: int, committed: int, depth_bytes: int) -> bool:
+    return ahead_offset - committed >= depth_bytes
+
+
 def _ack_key(session_id: UUID) -> str:
     return f"upload:ack:{session_id}"
 
 
 def _accepted_key(session_id: UUID) -> str:
     return f"upload:accepted:{session_id}"
-
-
-def _ack_event_key(session_id: UUID, expected_offset: int) -> str:
-    return f"upload:ack_event:{session_id}:{expected_offset}"
 
 
 def get_accepted_offset(session_id: UUID) -> Optional[int]:
@@ -190,15 +190,29 @@ def pop_upload_chunk(session_id: UUID, start: int) -> Optional[PendingUploadChun
 
 
 def signal_upload_ack(session_id: UUID, committed_offset: int) -> None:
+    _redis_client().set(
+        _ack_key(session_id),
+        str(committed_offset).encode(),
+        ex=FILE_TRANSFER_REDIS_ACK_TTL_SECONDS,
+    )
+
+
+def _wait_for_redis_offset(
+    key: str, min_offset: int, timeout: float, *, exclusive: bool = False
+) -> Optional[int]:
+    """Poll a scalar redis offset key. http handlers must not call this."""
     client = _redis_client()
-    ttl = FILE_TRANSFER_REDIS_ACK_TTL_SECONDS
-    value = str(committed_offset).encode()
-    event_key = _ack_event_key(session_id, committed_offset)
-    pipe = client.pipeline()
-    pipe.set(_ack_key(session_id), value, ex=ttl)
-    pipe.lpush(event_key, value)
-    pipe.expire(event_key, ttl)
-    pipe.execute()
+    deadline = time.monotonic() + timeout
+    while True:
+        existing = client.get(key)
+        if existing is not None:
+            offset = int(existing.decode())
+            if offset > min_offset if exclusive else offset >= min_offset:
+                return offset
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.05, remaining))
 
 
 def wait_for_upload_ack(
@@ -211,57 +225,14 @@ def wait_for_upload_ack(
     """
     if timeout is None:
         timeout = float(FILE_TRANSFER_ACK_WAIT_SECONDS)
-
-    client = _redis_client()
-    ack_key = _ack_key(session_id)
-    event_key = _ack_event_key(session_id, min_offset)
-
-    existing = client.get(ack_key)
-    if existing is not None:
-        offset = int(existing.decode())
-        if offset >= min_offset:
-            return offset
-
-    # Clear any stale event for this offset before blocking.
-    client.delete(event_key)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-
-        wait_seconds = max(1, min(int(remaining), 5))
-        result = client.blpop(event_key, timeout=wait_seconds)
-        if result is not None:
-            _, raw = result
-            offset = int(raw.decode())
-            if offset >= min_offset:
-                return offset
-
-        existing = client.get(ack_key)
-        if existing is not None:
-            offset = int(existing.decode())
-            if offset >= min_offset:
-                return offset
-
-    existing = client.get(ack_key)
-    if existing is not None:
-        offset = int(existing.decode())
-        if offset >= min_offset:
-            return offset
-    return None
+    return _wait_for_redis_offset(_ack_key(session_id), min_offset, timeout)
 
 
 def clear_upload_session_redis(session_id: UUID) -> None:
     client = _redis_client()
     client.delete(_ack_key(session_id), _accepted_key(session_id))
-    for pattern in (
-        f"{_chunk_prefix(session_id)}*",
-        f"upload:ack_event:{session_id}:*",
-    ):
-        for key in client.scan_iter(match=pattern):
-            client.delete(key)
+    for key in client.scan_iter(match=f"{_chunk_prefix(session_id)}*"):
+        client.delete(key)
 
 
 _STORE_DOWNLOAD_CHUNK_SCRIPT = """
@@ -271,8 +242,6 @@ if not created then
 end
 redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
 redis.call('SET', KEYS[3], ARGV[4], 'EX', ARGV[5])
-redis.call('LPUSH', KEYS[4], ARGV[4])
-redis.call('EXPIRE', KEYS[4], ARGV[5])
 return 1
 """
 
@@ -302,14 +271,6 @@ def _dl_ack_key(session_id: UUID) -> str:
     return f"download:ack:{session_id}"
 
 
-def _dl_ack_event_key(session_id: UUID, expected_offset: int) -> str:
-    return f"download:ack_event:{session_id}:{expected_offset}"
-
-
-def _dl_chunk_event_key(session_id: UUID, offset: int) -> str:
-    return f"download:chunk_event:{session_id}:{offset}"
-
-
 def get_download_offered_offset(session_id: UUID) -> Optional[int]:
     raw = _redis_client().get(_dl_offered_key(session_id))
     if raw is None:
@@ -334,13 +295,12 @@ def store_download_chunk(
     meta_key = _dl_chunk_meta_key_at(session_id, start)
     data_key = _dl_chunk_data_key_at(session_id, start)
     offered_key = _dl_offered_key(session_id)
-    chunk_event_key = _dl_chunk_event_key(session_id, start)
     meta = json.dumps({"start": start, "end": end}).encode()
     chunk_ttl = FILE_TRANSFER_REDIS_CHUNK_TTL_SECONDS
     offered_ttl = FILE_TRANSFER_REDIS_ACK_TTL_SECONDS
 
     created = _store_download_chunk_redis_script()(
-        keys=[meta_key, data_key, offered_key, chunk_event_key],
+        keys=[meta_key, data_key, offered_key],
         args=[meta, data, chunk_ttl, str(end + 1), offered_ttl],
     )
     if not created:
@@ -376,15 +336,11 @@ def delete_download_chunk(session_id: UUID, start: int) -> None:
 
 
 def signal_download_ack(session_id: UUID, committed_offset: int) -> None:
-    client = _redis_client()
-    ttl = FILE_TRANSFER_REDIS_ACK_TTL_SECONDS
-    value = str(committed_offset).encode()
-    event_key = _dl_ack_event_key(session_id, committed_offset)
-    pipe = client.pipeline()
-    pipe.set(_dl_ack_key(session_id), value, ex=ttl)
-    pipe.lpush(event_key, value)
-    pipe.expire(event_key, ttl)
-    pipe.execute()
+    _redis_client().set(
+        _dl_ack_key(session_id),
+        str(committed_offset).encode(),
+        ex=FILE_TRANSFER_REDIS_ACK_TTL_SECONDS,
+    )
 
 
 def wait_for_download_ack(
@@ -393,44 +349,7 @@ def wait_for_download_ack(
     """Block until client committed_offset >= min_offset (depth-check for agent push)."""
     if timeout is None:
         timeout = float(FILE_TRANSFER_ACK_WAIT_SECONDS)
-
-    client = _redis_client()
-    ack_key = _dl_ack_key(session_id)
-    event_key = _dl_ack_event_key(session_id, min_offset)
-
-    existing = client.get(ack_key)
-    if existing is not None:
-        offset = int(existing.decode())
-        if offset >= min_offset:
-            return offset
-
-    client.delete(event_key)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        wait_seconds = max(1, min(int(remaining), 5))
-        result = client.blpop(event_key, timeout=wait_seconds)
-        if result is not None:
-            _, raw = result
-            offset = int(raw.decode())
-            if offset >= min_offset:
-                return offset
-
-        existing = client.get(ack_key)
-        if existing is not None:
-            offset = int(existing.decode())
-            if offset >= min_offset:
-                return offset
-
-    existing = client.get(ack_key)
-    if existing is not None:
-        offset = int(existing.decode())
-        if offset >= min_offset:
-            return offset
-    return None
+    return _wait_for_redis_offset(_dl_ack_key(session_id), min_offset, timeout)
 
 
 def wait_for_download_chunk(
@@ -439,41 +358,9 @@ def wait_for_download_chunk(
     """Block until agent has pushed a chunk at `offset`, or until timeout."""
     if timeout is None:
         timeout = float(FILE_TRANSFER_ACK_WAIT_SECONDS)
-
-    client = _redis_client()
-    event_key = _dl_chunk_event_key(session_id, offset)
-    offered_key = _dl_offered_key(session_id)
-
-    existing = client.get(offered_key)
-    if existing is not None:
-        offered = int(existing.decode())
-        if offered > offset:
-            return offered
-
-    client.delete(event_key)
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        wait_seconds = max(1, min(int(remaining), 5))
-        result = client.blpop(event_key, timeout=wait_seconds)
-        if result is not None:
-            return int(result[1].decode())
-
-        existing = client.get(offered_key)
-        if existing is not None:
-            offered = int(existing.decode())
-            if offered > offset:
-                return offered
-
-    existing = client.get(offered_key)
-    if existing is not None:
-        offered = int(existing.decode())
-        if offered > offset:
-            return offered
-    return None
+    return _wait_for_redis_offset(
+        _dl_offered_key(session_id), offset, timeout, exclusive=True
+    )
 
 
 def clear_download_session_redis(session_id: UUID) -> None:
@@ -482,10 +369,5 @@ def clear_download_session_redis(session_id: UUID) -> None:
         _dl_offered_key(session_id),
         _dl_ack_key(session_id),
     )
-    for pattern in (
-        f"{_dl_chunk_prefix(session_id)}*",
-        f"download:ack_event:{session_id}:*",
-        f"download:chunk_event:{session_id}:*",
-    ):
-        for key in client.scan_iter(match=pattern):
-            client.delete(key)
+    for key in client.scan_iter(match=f"{_dl_chunk_prefix(session_id)}*"):
+        client.delete(key)

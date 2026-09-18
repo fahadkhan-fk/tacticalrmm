@@ -439,13 +439,24 @@ def parse_upload_content_range(
     return (start, end), None
 
 
-def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
-    return validate_absolute_agent_path(
-        path,
+def canonical_file_browser_path(
+    path: str, plat: str
+) -> Tuple[Optional[str], Optional[str]]:
+    value = normalize_file_browser_path(path, plat)
+    err = validate_absolute_agent_path(
+        value,
         plat,
         field="path",
-        normalize=True,
+        normalize=False,
     )
+    if err:
+        return None, err
+    return value, None
+
+
+def validate_file_browser_path(path: str, plat: str) -> Optional[str]:
+    _value, err = canonical_file_browser_path(path, plat)
+    return err
 
 
 def sanitize_file_browser_name_filter(raw) -> Tuple[Optional[str], Optional[str]]:
@@ -551,19 +562,28 @@ def normalize_file_browser_properties(raw) -> Optional[dict]:
     return item
 
 
-def validate_file_browser_paths(paths, plat: str) -> Optional[str]:
+def canonical_file_browser_paths(
+    paths, plat: str
+) -> Tuple[Optional[list], Optional[str]]:
     if not isinstance(paths, list) or not paths:
-        return "paths is required"
+        return None, "paths is required"
     if len(paths) > FILE_BROWSER_MAX_DELETE_PATHS:
-        return f"paths must not exceed {FILE_BROWSER_MAX_DELETE_PATHS} items"
+        return None, f"paths must not exceed {FILE_BROWSER_MAX_DELETE_PATHS} items"
 
+    canonical: list[str] = []
     for path in paths:
         if not isinstance(path, str) or not path.strip():
-            return "paths must be non-empty strings"
-        path_err = validate_file_browser_path(path.strip(), plat)
+            return None, "paths must be non-empty strings"
+        value, path_err = canonical_file_browser_path(path, plat)
         if path_err:
-            return path_err
-    return None
+            return None, path_err
+        canonical.append(value)
+    return canonical, None
+
+
+def validate_file_browser_paths(paths, plat: str) -> Optional[str]:
+    _canonical, err = canonical_file_browser_paths(paths, plat)
+    return err
 
 
 def collect_file_transfer_paths(

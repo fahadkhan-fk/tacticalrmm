@@ -150,6 +150,7 @@ from .file_transfer_relay import (
     get_download_offered_offset,
     get_upload_ack,
     peek_download_chunk,
+    pipeline_depth_full,
     rollback_upload_chunk,
     signal_download_ack,
     store_upload_chunk,
@@ -160,15 +161,14 @@ from .utils import (
     normalize_file_browser_item,
     normalize_file_browser_items,
     normalize_file_browser_properties,
-    normalize_file_browser_path,
     parse_upload_content_range,
     resolve_upload_destination_path,
     send_nats_command,
     send_nats_notification,
     collect_file_transfer_paths,
+    canonical_file_browser_path,
+    canonical_file_browser_paths,
     validate_file_browser_name,
-    validate_file_browser_path,
-    validate_file_browser_paths,
     sanitize_file_browser_name_filter,
     validate_file_transfer_destination_path,
     validate_file_transfer_filename,
@@ -1738,11 +1738,12 @@ def enforce_file_transfer_session_limits(agent, user):
 
 def create_file_transfer_session_locked(agent, user, **fields):
     """Atomically enforce concurrency caps and create the session."""
+    from accounts.models import User
     from agents.tasks import expire_stale_file_transfer_sessions
 
     with transaction.atomic():
-        # Lock the agent row so concurrent inits for this agent serialize here.
         Agent.objects.select_for_update().filter(pk=agent.pk).first()
+        User.objects.select_for_update().filter(pk=user.pk).first()
         expire_stale_file_transfer_sessions(agent=agent, notify_agent=False)
         limit_err = enforce_file_transfer_session_limits(agent, user)
         if limit_err is not None:
@@ -1886,7 +1887,7 @@ class ListFiles(APIView):
             )
 
         if path:
-            path_err = validate_file_browser_path(path, agent.plat)
+            path, path_err = canonical_file_browser_path(path, agent.plat)
             if path_err:
                 return notify_error(path_err)
         elif page != 1:
@@ -1951,7 +1952,7 @@ class GetFileProperties(APIView):
         if not path:
             return notify_error("path is required")
 
-        path_err = validate_file_browser_path(path, agent.plat)
+        path, path_err = canonical_file_browser_path(path, agent.plat)
         if path_err:
             return notify_error(path_err)
 
@@ -2017,7 +2018,8 @@ class CheckFileExists(APIView):
         path = (request.data.get("path") or "").strip()
         if not path:
             return notify_error("path is required")
-        path_err = validate_file_browser_path(path, agent.plat)
+
+        path, path_err = canonical_file_browser_path(path, agent.plat)
         if path_err:
             return notify_error(path_err)
 
@@ -2083,7 +2085,7 @@ class CreateFileFolder(APIView):
         if not path:
             return notify_error("path is required")
 
-        path_err = validate_file_browser_path(path, agent.plat)
+        path, path_err = canonical_file_browser_path(path, agent.plat)
         if path_err:
             return notify_error(path_err)
 
@@ -2092,7 +2094,6 @@ class CreateFileFolder(APIView):
             return notify_error(name_err)
 
         name = str(raw_name).strip()
-        path = normalize_file_browser_path(path, agent.plat)
 
         response = send_nats_command(
             agent,
@@ -2137,7 +2138,7 @@ class RenameFile(APIView):
         if not raw_path:
             return notify_error("path is required")
 
-        path_err = validate_file_browser_path(raw_path, agent.plat)
+        path, path_err = canonical_file_browser_path(raw_path, agent.plat)
         if path_err:
             return notify_error(path_err)
 
@@ -2145,7 +2146,6 @@ class RenameFile(APIView):
         if name_err:
             return notify_error(name_err)
 
-        path = normalize_file_browser_path(raw_path, agent.plat)
         new_name = str(raw_new_name).strip()
 
         response = send_nats_command(
@@ -2182,11 +2182,9 @@ def _delete_agent_files(request, agent_id):
         return agent
 
     paths = request.data.get("paths")
-    paths_err = validate_file_browser_paths(paths, agent.plat)
+    normalized_paths, paths_err = canonical_file_browser_paths(paths, agent.plat)
     if paths_err:
         return notify_error(paths_err)
-
-    normalized_paths = [path.strip() for path in paths]
     response = send_nats_command(
         agent,
         "files_delete",
@@ -2359,13 +2357,13 @@ class UploadFileChunk(APIView):
     def put(self, request, agent_id, session_id):
         """Accept one chunk from the client.
 
-        Depth-1 prefetch protocol:
-          - Django accepts up to 1 chunk ahead of what the agent has committed.
+        Pipeline-depth protocol:
+          - Django accepts up to FILE_TRANSFER_PIPELINE_DEPTH chunks ahead of
+            what the agent has committed (same cap as download).
           - The PUT returns immediately once the chunk is stored in Redis and
-            NATS-notified.  The client does NOT wait for the agent to write.
-          - If the client is already 1 chunk ahead (depth full), the PUT blocks
-            only until the agent commits the previous chunk, then accepts and
-            returns immediately.
+            NATS-notified. The client does not wait for the agent to write.
+          - If the pipeline is full, the put is retryable until the agent
+            commits enough to free a slot.
 
         Response fields:
           accepted_offset  — client should start the next chunk here
@@ -2450,10 +2448,10 @@ class UploadFileChunk(APIView):
             )
 
         depth_bytes = FILE_TRANSFER_PIPELINE_DEPTH * session.chunk_size
-        if start - committed > depth_bytes:
+        if pipeline_depth_full(start, committed, depth_bytes):
             redis_committed = get_upload_ack(session.session_id)
             committed = max(committed, redis_committed or 0)
-            if start - committed > depth_bytes:
+            if pipeline_depth_full(start, committed, depth_bytes):
                 session.refresh_from_db(fields=["status", "error_message"])
                 if session.status == FileTransferStatus.FAILED:
                     clear_upload_session_redis(session.session_id)
@@ -2537,15 +2535,7 @@ class CompleteFileUpload(APIView):
 
         if session.status == FileTransferStatus.COMPLETED:
             client_sha256 = (request.data.get("sha256") or "").strip().lower()
-            return Response(
-                {
-                    "session_id": str(session.session_id),
-                    "status": session.status,
-                    "destination_path": session.destination_path,
-                    "committed_offset": session.committed_offset,
-                    "sha256": client_sha256,
-                }
-            )
+            return Response(_upload_complete_body(session, client_sha256))
 
         if session.status not in (
             FileTransferStatus.AGENT_READY,
@@ -2593,31 +2583,18 @@ class CompleteFileUpload(APIView):
             agent, "files_upload_finalize", finalize_payload, timeout=30
         )
 
-        if isinstance(response, Response):
-            _fail_transfer_session(session, agent, str(response.data))
-            return response
-
-        if not isinstance(response, dict):
-            _fail_transfer_session(session, agent, "Invalid agent response")
-            return notify_error("Invalid agent response")
-
-        if response.get("status") != "completed":
-            error_message = response.get("error") or "Agent failed to finalize upload"
-            _fail_transfer_session(session, agent, str(error_message))
-            return notify_error(str(error_message))
+        if not _nats_finalize_succeeded(response):
+            return _upload_finalize_failure_response(
+                session, agent, response, client_sha256
+            )
 
         clear_upload_session_redis(session.session_id)
-        session.status = FileTransferStatus.COMPLETED
-        session.save(update_fields=["status", "updated_at"])
+        session = _mark_transfer_completed(session)
+        if session.status != FileTransferStatus.COMPLETED:
+            return notify_error("Upload session is not ready to complete")
 
         return Response(
-            {
-                "session_id": str(session.session_id),
-                "status": session.status,
-                "destination_path": session.destination_path,
-                "committed_offset": committed_offset,
-                "sha256": response.get("sha256", ""),
-            }
+            _upload_complete_body(session, response.get("sha256") or client_sha256)
         )
 
 
@@ -3116,6 +3093,9 @@ class CompleteFileDownload(APIView):
             _expire_transfer_session(session, agent)
             return notify_error("Download session has expired")
 
+        if session.status == FileTransferStatus.COMPLETED:
+            return Response(_download_complete_body(session, ""))
+
         if session.status not in (
             FileTransferStatus.AGENT_READY,
             FileTransferStatus.TRANSFERRING,
@@ -3150,32 +3130,15 @@ class CompleteFileDownload(APIView):
             agent, "files_download_finalize", finalize_payload, timeout=30
         )
 
-        if isinstance(response, Response):
-            _fail_transfer_session(session, agent, str(response.data))
-            return response
-
-        if not isinstance(response, dict):
-            _fail_transfer_session(session, agent, "Invalid agent response")
-            return notify_error("Invalid agent response")
-
-        if response.get("status") != "completed":
-            error_message = response.get("error") or "Agent failed to finalize download"
-            _fail_transfer_session(session, agent, str(error_message))
-            return notify_error(str(error_message))
+        if not _nats_finalize_succeeded(response):
+            return _download_finalize_failure_response(session, agent, response)
 
         clear_download_session_redis(session.session_id)
-        session.status = FileTransferStatus.COMPLETED
-        session.save(update_fields=["status", "updated_at"])
+        session = _mark_transfer_completed(session)
+        if session.status != FileTransferStatus.COMPLETED:
+            return notify_error("Download session is not ready to complete")
 
-        return Response(
-            {
-                "session_id": str(session.session_id),
-                "status": session.status,
-                "source_path": session.destination_path,
-                "committed_offset": committed_offset,
-                "sha256": response.get("sha256", ""),
-            }
-        )
+        return Response(_download_complete_body(session, response.get("sha256", "")))
 
 
 _FILE_TRANSFER_AGENT_RELEASE_TIMEOUT = 5
@@ -3185,12 +3148,129 @@ _FILE_TRANSFER_RELEASED_STATUSES = (
 )
 
 
+def _upload_complete_body(session: FileTransferSession, sha256: str) -> dict:
+    return {
+        "session_id": str(session.session_id),
+        "status": session.status,
+        "destination_path": session.destination_path,
+        "committed_offset": session.committed_offset,
+        "sha256": sha256 or "",
+    }
+
+
+def _download_complete_body(session: FileTransferSession, sha256: str) -> dict:
+    return {
+        "session_id": str(session.session_id),
+        "status": session.status,
+        "source_path": session.destination_path,
+        "committed_offset": session.committed_offset,
+        "sha256": sha256 or "",
+    }
+
+
+def _nats_finalize_succeeded(response) -> bool:
+    return isinstance(response, dict) and response.get("status") == "completed"
+
+
+def _nats_finalize_error(response, fallback: str) -> str:
+    if isinstance(response, Response):
+        data = response.data
+        if isinstance(data, str) and data.strip():
+            return data.strip()[:2048]
+        return str(data)[:2048]
+    if isinstance(response, dict):
+        return str(response.get("error") or fallback)[:2048]
+    return "Invalid agent response"
+
+
+def _session_completed_during_nats(session: FileTransferSession) -> bool:
+    session.refresh_from_db()
+    return session.status == FileTransferStatus.COMPLETED
+
+
+def _mark_transfer_completed(session: FileTransferSession) -> FileTransferSession:
+    with transaction.atomic():
+        locked = (
+            FileTransferSession.objects.select_for_update()
+            .filter(pk=session.pk)
+            .first()
+        )
+        if locked is None:
+            return session
+        if locked.status == FileTransferStatus.CANCELLED:
+            return locked
+        locked.status = FileTransferStatus.COMPLETED
+        locked.error_message = ""
+        locked.save(update_fields=["status", "error_message", "updated_at"])
+        return locked
+
+
+def _apply_transfer_terminal_status(
+    session: FileTransferSession,
+    new_status: str,
+    error_message: str,
+) -> bool:
+    with transaction.atomic():
+        locked = (
+            FileTransferSession.objects.select_for_update()
+            .filter(pk=session.pk)
+            .first()
+        )
+        if locked is None:
+            return False
+        if locked.status in _FILE_TRANSFER_RELEASED_STATUSES:
+            session.status = locked.status
+            session.error_message = locked.error_message
+            session.committed_offset = locked.committed_offset
+            session.destination_path = locked.destination_path
+            return False
+        locked.status = new_status
+        locked.error_message = error_message
+        locked.save(update_fields=["status", "error_message", "updated_at"])
+        session.status = locked.status
+        session.error_message = locked.error_message
+        return True
+
+
+def _upload_finalize_failure_response(
+    session: FileTransferSession,
+    agent,
+    response,
+    client_sha256: str,
+):
+    if _session_completed_during_nats(session):
+        return Response(_upload_complete_body(session, client_sha256))
+    fail_message = _nats_finalize_error(response, "Agent failed to finalize upload")
+    _fail_transfer_session(session, agent, fail_message)
+    if session.status == FileTransferStatus.COMPLETED:
+        return Response(_upload_complete_body(session, client_sha256))
+    if isinstance(response, Response):
+        return response
+    return notify_error(fail_message)
+
+
+def _download_finalize_failure_response(session: FileTransferSession, agent, response):
+    if _session_completed_during_nats(session):
+        return Response(_download_complete_body(session, ""))
+    fail_message = _nats_finalize_error(response, "Agent failed to finalize download")
+    _fail_transfer_session(session, agent, fail_message)
+    if session.status == FileTransferStatus.COMPLETED:
+        return Response(_download_complete_body(session, ""))
+    if isinstance(response, Response):
+        return response
+    return notify_error(fail_message)
+
+
 def _release_download_session(
     session: FileTransferSession,
     agent,
     error_message: str = "Download cancelled",
     new_status: str = FileTransferStatus.FAILED,
 ) -> None:
+    session.refresh_from_db()
+    if session.status in _FILE_TRANSFER_RELEASED_STATUSES:
+        return
+
     clear_download_session_redis(session.session_id)
     finalize_payload = {
         "session_id": str(session.session_id),
@@ -3208,9 +3288,8 @@ def _release_download_session(
             session.session_id,
             response.get("error"),
         )
-    session.status = new_status
-    session.error_message = error_message
-    session.save(update_fields=["status", "error_message", "updated_at"])
+    if not _apply_transfer_terminal_status(session, new_status, error_message):
+        return
     _log_transfer_terminal(session, error_message)
 
 
@@ -3220,6 +3299,10 @@ def _release_upload_session(
     error_message: str = "Upload cancelled",
     new_status: str = FileTransferStatus.FAILED,
 ) -> None:
+    session.refresh_from_db()
+    if session.status in _FILE_TRANSFER_RELEASED_STATUSES:
+        return
+
     clear_upload_session_redis(session.session_id)
     abort_payload = {"session_id": str(session.session_id)}
     response = send_nats_command(
@@ -3234,9 +3317,8 @@ def _release_upload_session(
             session.session_id,
             response.get("error"),
         )
-    session.status = new_status
-    session.error_message = error_message
-    session.save(update_fields=["status", "error_message", "updated_at"])
+    if not _apply_transfer_terminal_status(session, new_status, error_message):
+        return
     _log_transfer_terminal(session, error_message)
 
 

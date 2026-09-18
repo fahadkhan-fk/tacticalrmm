@@ -18,6 +18,7 @@ from agents.file_transfer_relay import (
     get_download_ack,
     get_download_offered_offset,
     get_upload_ack,
+    pipeline_depth_full,
     pop_upload_chunk,
     signal_upload_ack,
     store_download_chunk,
@@ -190,7 +191,7 @@ def download_relay_put_state(session):
             FileTransferStatus.TRANSFERRING,
         )
         and offered < session.total_size
-        and (offered - committed) < depth_bytes
+        and not pipeline_depth_full(offered, committed, depth_bytes)
     )
     return committed, offered, can_put
 
